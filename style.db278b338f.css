@@ -545,6 +545,9 @@ code {
 @media (pointer: coarse) {
   .act { padding: 10px 0; font-size: 14.5px; }
   .row { gap: 22px; }
+  /* Keep every tappable thing at or above the 24px minimum target size. */
+  .foot a { display: inline-block; padding: 5px 0; }
+  .auto { padding: 6px 0; }
 }
 
 @media (max-width: 420px) {

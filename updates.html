@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <title>dropline — update log</title>
 <meta name="description" content="Release notes and roadmap for dropline.">
-<link rel="stylesheet" href="style.cb2a0adc52.css">
+<link rel="stylesheet" href="style.db278b338f.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='3' fill='%23D97757'/></svg>">
 </head>
 <body class="doc">
@@ -31,11 +31,10 @@
         <p>
           Roughly 10–20% of network pairs — two symmetric NATs, or a strict
           corporate firewall — cannot form a direct connection, and those
-          transfers fail outright. The client reads short-lived credentials from
-          a configurable endpoint, and a Cloudflare Worker that mints them ships
-          in <code>worker/turn-credentials.js</code>. It needs a Cloudflare
-          account and an API token to go live. Until then this remains the single
-          biggest gap.
+          transfers fail outright. The relay worker is deployed and the client
+          is wired to it, but it is not yet issuing credentials: it needs a TURN
+          key created in the Cloudflare dashboard. Until that exists this remains
+          the single biggest gap, and the app quietly falls back to STUN.
         </p>
       </li>
       <li>
@@ -76,6 +75,52 @@
 
   <section class="panel">
     <h2 class="sect">Releases</h2>
+
+    <article class="rel">
+      <h3>v1.1 <time datetime="2026-08-23">23 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>The interface was stripped back.</strong> Boxes and filled
+          buttons are gone; actions are text with an underline that draws on
+          hover, inputs are a single hairline, and hierarchy comes from
+          whitespace and weight rather than borders.
+        </li>
+        <li>
+          <strong>The orange square is now the state, not decoration.</strong>
+          It breathes while waiting, tumbles while connecting, settles once on
+          connect, and pulses an outward echo while bytes are moving. One
+          attribute drives all of it — and every state is still written in
+          words, so nothing depends on seeing the motion.
+        </li>
+        <li>
+          <strong>Files are checksummed end to end.</strong> A rolling CRC32 is
+          computed as the file streams — before compression on the way out,
+          after decompression on the way in — and compared on arrival. A
+          mismatch fails the transfer visibly and refuses to offer the file for
+          download. This targets the exact bug that shipped in v0.3, where
+          reordered chunks corrupted a file with nothing on screen to suggest
+          anything was wrong.
+        </li>
+        <li>
+          <strong>The screen is held awake during a transfer</strong> and
+          released the moment it finishes — the difference between a phone
+          finishing a large file and sleeping halfway through.
+        </li>
+        <li>
+          Drop anywhere on the page, not just onto the box. Received images get
+          a thumbnail. The tab title shows transfer progress. Native share sheet
+          where the browser has one. An auto-accept toggle, and Escape to
+          decline.
+        </li>
+        <li>
+          <strong>Transfer rates are smoothed.</strong> A running total-over-
+          elapsed average reports a figure from half a minute ago and jitters
+          badly at the start; an exponential moving average tracks what the link
+          is actually doing.
+        </li>
+        <li>51 unit tests, including the canonical CRC-32 check vector.</li>
+      </ul>
+    </article>
 
     <article class="rel">
       <h3>v1.0 <time datetime="2026-08-23">23 Aug 2026</time></h3>
