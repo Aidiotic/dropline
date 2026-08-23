@@ -1087,6 +1087,7 @@ DL.session = (function () {
 
         setupStripes(c);
 
+        flushOutbox();
         emit('status', 'connected');
         describeLink().then((link) => { if (link) emit('link-quality', link); });
         setTimeout(() => describeLink().then((l) => { if (l) emit('link-quality', l); }), 2500);
@@ -1210,13 +1211,17 @@ DL.session = (function () {
           break;
 
         case P.T.PROOF: {
+          // Ignore anything we did not ask for: a late reply from a previous
+          // connection is not an impostor, and tearing the session down for
+          // one would be worse than the problem.
           if (!secret || !myNonce) break;
           const want = await digest(`${secret}:${myNonce}`);
+          myNonce = null;
           if (msg.value === want) {
             authed = true;
             emit('authenticated', true);
           } else {
-            emit('error', 'The other device could not prove it has this link. Disconnecting.');
+            emit('error', 'The other device could not prove it holds this link.');
             close();
           }
           break;
@@ -1403,7 +1408,19 @@ DL.session = (function () {
 
     let pendingOut = null;
 
-    function send(raw) { if (live()) conn.send(raw); }
+    // Control messages can be produced before the channel reports open --
+    // a peer's auth challenge routinely arrives first -- and dropping them
+    // silently strands the handshake. Queue instead, and flush on open.
+    const outbox = [];
+
+    function send(raw) {
+      if (live()) { conn.send(raw); return; }
+      if (!closed) outbox.push(raw);
+    }
+
+    function flushOutbox() {
+      while (outbox.length && live()) conn.send(outbox.shift());
+    }
 
     function enqueue(entries) {
       outQueue.push(entries);
