@@ -6,7 +6,11 @@
 <meta name="color-scheme" content="light dark">
 <title>dropline</title>
 <meta name="description" content="Send files straight between two browsers. Nothing is uploaded, nothing is stored.">
-<link rel="stylesheet" href="style.db278b338f.css">
+<link rel="stylesheet" href="style.3c1503eb30.css">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#F0EEE6" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#171615" media="(prefers-color-scheme: dark)">
+<link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='3' fill='%23D97757'/></svg>">
 </head>
 <body>
@@ -19,6 +23,7 @@
       <span class="mark" aria-hidden="true"><i></i></span>dropline
     </h1>
     <p class="statusline" id="statusline"></p>
+    <p class="linkq" id="link-quality" hidden></p>
   </header>
 
   <p id="live" class="sr-only" role="status" aria-live="polite"></p>
@@ -34,6 +39,11 @@
       </div>
     </div>
     <p class="hint">Open the link on the other device, or scan the code.</p>
+    <div class="verify" id="verify-wrap" hidden>
+      <span class="verify-label">Verification code</span>
+      <span class="verify-code" id="verify-code">····</span>
+      <span class="verify-note">Both devices must show the same code.</span>
+    </div>
   </section>
 
   <!-- ── Session ────────────────────────────────────────────── -->
@@ -81,8 +91,12 @@
   </section>
 
   <footer class="foot">
-    <span>Encrypted peer-to-peer</span>
+    <span class="foot-meta">
+      <span id="device-note"></span>
+    </span>
     <span class="foot-links">
+      <button id="theme-btn" type="button" class="foot-btn">Theme: auto</button>
+      <button id="install-btn" type="button" class="foot-btn" hidden>Install</button>
       <a href="updates.html">Updates</a>
       <a href="https://github.com/Aidiotic/dropline">Source</a>
     </span>
@@ -99,6 +113,6 @@
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"
         integrity="sha384-lQXOAyZwHXE55JFyrOMB7nY2Wv+m5ZWNtJcHrd1rceRQXAYNLak8ukN5TjBTcIwz"
         crossorigin="anonymous"></script>
-<script src="dropline.8bdcfc631c.js"></script>
+<script src="dropline.9afc432218.js"></script>
 </body>
 </html>

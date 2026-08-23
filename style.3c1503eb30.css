@@ -564,3 +564,100 @@ code {
   }
   .mark i { opacity: 1 !important; }
 }
+
+/* ── device-adaptive layer ───────────────────────────────────────
+   DL.device publishes tier / form / density / motion on <html>; the rules
+   below are the only place those decisions turn into pixels. */
+
+:root[data-density="compact"] { --step: 22px; }
+:root[data-density="cosy"]    { --step: 32px; }
+:root[data-density="roomy"]   { --step: 44px; }
+
+:root[data-form="phone"]   #app { max-width: 100%; }
+:root[data-form="tablet"]  #app { max-width: 520px; }
+:root[data-form="desktop"] #app { max-width: 440px; }
+
+/* A phone gets bigger type and a taller drop target; a desktop gets neither. */
+:root[data-form="phone"] body { font-size: 16px; }
+:root[data-form="phone"] .drop { padding: 46px 20px; }
+:root[data-form="phone"] .drop-title { font-size: 18px; }
+:root[data-form="desktop"] .drop { padding: 34px 20px; }
+
+/* Low-end or data-saving devices drop the decorative work first: the sheen
+   repaints a gradient every frame, and the echo animates a second layer. */
+:root[data-motion="minimal"] .row-item[data-state="active"] .bar::after,
+:root[data-motion="none"]    .row-item[data-state="active"] .bar::after { display: none; }
+:root[data-motion="minimal"] #app[data-state="busy"] .mark::after { animation: none; opacity: .35; }
+:root[data-motion="none"] .mark i { animation: none !important; opacity: 1; }
+:root[data-motion="none"] .view,
+:root[data-motion="none"] .row-item { animation: none; }
+
+/* Manual theme override beats the system preference. */
+:root[data-theme="light"] {
+  --paper: #F0EEE6; --raised: #E7E4DA; --ink: #141413;
+  --muted: #716E65; --faint: #C9C5B8; --rule: #DFDBCE;
+  --ok: #3F7D4E; --bad: #A8321A;
+}
+:root[data-theme="dark"] {
+  --paper: #171615; --raised: #201E1C; --ink: #F0EEE6;
+  --muted: #9C978C; --faint: #3B3833; --rule: #2C2A26;
+  --ok: #6FBF7F; --bad: #E8927C;
+}
+
+/* ── verification ── */
+
+.verify {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-top: 22px;
+  padding-left: 14px;
+  border-left: 2px solid var(--faint);
+  transition: border-color .3s var(--ease);
+}
+
+.verify[data-state="verified"] { border-left-color: var(--ok); }
+.verify[data-state="unverified"] { border-left-color: var(--bad); }
+
+.verify-label {
+  font-size: 11px;
+  font-weight: 620;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.verify-code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 20px;
+  font-weight: 620;
+  letter-spacing: 0.18em;
+  color: var(--ink);
+}
+
+.verify[data-state="verified"] .verify-code { color: var(--ok); }
+.verify-note { flex-basis: 100%; font-size: 12px; color: var(--muted); }
+
+/* ── connection quality ── */
+
+.linkq { margin: 6px 0 0; font-size: 12.5px; color: var(--muted); }
+.linkq[data-relayed="true"]::before { content: '⇄ '; }
+.linkq[data-relayed="false"]::before { content: '→ '; }
+
+/* ── footer controls ── */
+
+.foot-meta { color: var(--muted); }
+
+.foot-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: color .18s var(--ease);
+}
+
+.foot-btn:hover { color: var(--ink); }

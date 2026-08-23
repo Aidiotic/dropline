@@ -161,6 +161,213 @@ DL.util = (function () {
 if (typeof module !== 'undefined' && module.exports) module.exports = DL.util;
 
 
+/* ── src/device.js ── */
+/* Device profiling.
+ *
+ * One place decides what this machine is and what it can afford, and every
+ * other module reads the answer. Nothing here guesses from user-agent strings
+ * where a real capability signal exists.
+ *
+ * Two outputs:
+ *   - a performance budget (chunk sizes, watermarks, repaint rate, motion)
+ *   - a layout shape (form factor, density) published as attributes on <html>
+ *     so CSS can respond without JavaScript touching styles.
+ */
+
+var DL = (typeof DL !== 'undefined') ? DL : {};
+
+DL.device = (function () {
+  const listeners = [];
+  let profile = null;
+
+  const mq = (q) => (typeof matchMedia === 'function' ? matchMedia(q) : { matches: false, addEventListener() {} });
+
+  function readSignals() {
+    const nav = typeof navigator !== 'undefined' ? navigator : {};
+    const conn = nav.connection || nav.mozConnection || nav.webkitConnection || null;
+    const w = typeof innerWidth === 'number' ? innerWidth : 1024;
+    const h = typeof innerHeight === 'number' ? innerHeight : 768;
+
+    return {
+      memory: nav.deviceMemory || null,          // GB, coarse and capped at 8
+      cores: nav.hardwareConcurrency || null,
+      effectiveType: conn ? conn.effectiveType : null,   // '4g' | '3g' | '2g' | 'slow-2g'
+      downlink: conn ? conn.downlink : null,             // Mbit/s estimate
+      rtt: conn ? conn.rtt : null,
+      saveData: !!(conn && conn.saveData),
+      coarse: mq('(pointer: coarse)').matches,
+      hover: mq('(hover: hover)').matches,
+      reduceMotion: mq('(prefers-reduced-motion: reduce)').matches,
+      width: w,
+      height: h,
+      landscape: w > h,
+      dpr: typeof devicePixelRatio === 'number' ? devicePixelRatio : 1,
+      battery: batteryState,
+    };
+  }
+
+  // Battery is async and may be unavailable; kept in a slot the sync read uses.
+  let batteryState = { level: null, charging: null };
+
+  function watchBattery() {
+    if (typeof navigator === 'undefined' || !navigator.getBattery) return;
+    navigator.getBattery().then((b) => {
+      const sync = () => {
+        batteryState = { level: b.level, charging: b.charging };
+        recompute();
+      };
+      b.addEventListener('levelchange', sync);
+      b.addEventListener('chargingchange', sync);
+      sync();
+    }).catch(() => {});
+  }
+
+  /* ── tiering ──
+     A score, not a lookup table: the same phone is a different machine on a
+     dying battery over 3G than it is plugged in on wifi. */
+
+  function tierFor(s) {
+    let score = 0;
+
+    if (s.memory !== null) score += s.memory >= 8 ? 2 : s.memory >= 4 ? 1 : -1;
+    else score += 0;                                   // unknown: assume middling
+
+    if (s.cores !== null) score += s.cores >= 8 ? 2 : s.cores >= 4 ? 1 : -1;
+
+    if (s.effectiveType === '4g') score += 1;
+    else if (s.effectiveType === '3g') score -= 1;
+    else if (s.effectiveType === '2g' || s.effectiveType === 'slow-2g') score -= 3;
+
+    if (s.saveData) score -= 3;                        // an explicit request
+    if (s.battery.level !== null && s.battery.level < 0.2 && !s.battery.charging) score -= 2;
+
+    // 8 GB + 8 cores + 4g scores 5; 4 GB + 4 cores + 4g scores 3, which is a
+    // mid-range machine and should be treated as one.
+    if (score >= 4) return 'high';
+    if (score >= 0) return 'mid';
+    return 'low';
+  }
+
+  function formFor(s) {
+    if (s.width < 600) return 'phone';
+    if (s.width < 900 || (s.coarse && !s.hover)) return 'tablet';
+    return 'desktop';
+  }
+
+  function densityFor(s, form) {
+    if (form === 'phone') return s.height < 700 ? 'compact' : 'cosy';
+    if (form === 'tablet') return 'cosy';
+    return s.height < 760 ? 'cosy' : 'roomy';
+  }
+
+  function motionFor(s, tier) {
+    if (s.reduceMotion) return 'none';
+    if (s.saveData) return 'minimal';
+    if (tier === 'low') return 'minimal';
+    if (s.battery.level !== null && s.battery.level < 0.2 && !s.battery.charging) return 'minimal';
+    return 'full';
+  }
+
+  const MB = 1024 * 1024;
+
+  function budgetFor(tier, s) {
+    // Memory-bound knobs scale with the tier; the network-bound one also
+    // respects an explicit save-data request.
+    const table = {
+      low:  { seal: 2 * MB, watermark: 1 * MB, chunkCap: 64 * 1024,  repaintMs: 150 },
+      mid:  { seal: 4 * MB, watermark: 4 * MB, chunkCap: 192 * 1024, repaintMs: 90 },
+      high: { seal: 8 * MB, watermark: 8 * MB, chunkCap: 256 * 1024, repaintMs: 60 },
+    }[tier];
+
+    return {
+      ...table,
+      // Thumbnails decode a whole image into memory; not worth it on a phone
+      // that is already tight, or when the user asked us to save data.
+      thumbnails: tier !== 'low' && !s.saveData,
+      // Compression is CPU work. On a slow link it pays for itself many times
+      // over; on a fast link with few cores it can be the bottleneck.
+      preferCompression: s.effectiveType === '2g' || s.effectiveType === 'slow-2g'
+        || s.effectiveType === '3g' || s.saveData
+        || (s.cores === null || s.cores >= 4),
+      qrPixels: tier === 'low' ? 132 : 148,
+    };
+  }
+
+  function build() {
+    const signals = readSignals();
+    const tier = tierFor(signals);
+    const form = formFor(signals);
+    const density = densityFor(signals, form);
+    const motion = motionFor(signals, tier);
+    return {
+      signals, tier, form, density, motion,
+      ...budgetFor(tier, signals),
+      // A short human-readable summary, shown in the interface.
+      describe() {
+        const bits = [form, tier === 'high' ? 'high performance' : tier === 'low' ? 'power saving' : 'balanced'];
+        if (signals.saveData) bits.push('data saver');
+        return bits.join(' · ');
+      },
+    };
+  }
+
+  function apply(p) {
+    if (typeof document === 'undefined') return;
+    const root = document.documentElement;
+    root.dataset.tier = p.tier;
+    root.dataset.form = p.form;
+    root.dataset.density = p.density;
+    root.dataset.motion = p.motion;
+  }
+
+  function recompute() {
+    const next = build();
+    const changed = !profile
+      || next.tier !== profile.tier
+      || next.form !== profile.form
+      || next.density !== profile.density
+      || next.motion !== profile.motion;
+    profile = next;
+    apply(profile);
+    if (changed) listeners.forEach((fn) => { try { fn(profile); } catch { /* listener's problem */ } });
+    return profile;
+  }
+
+  function init() {
+    recompute();
+    watchBattery();
+
+    if (typeof window !== 'undefined') {
+      let resizeTimer = null;
+      addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(recompute, 180);
+      });
+      addEventListener('orientationchange', () => setTimeout(recompute, 120));
+
+      const conn = navigator.connection;
+      if (conn && conn.addEventListener) conn.addEventListener('change', recompute);
+
+      mq('(prefers-reduced-motion: reduce)').addEventListener('change', recompute);
+      mq('(pointer: coarse)').addEventListener('change', recompute);
+    }
+    return profile;
+  }
+
+  return {
+    init,
+    recompute,
+    onChange(fn) { listeners.push(fn); },
+    get profile() { return profile || (profile = build()); },
+    // exposed for tests
+    _tierFor: tierFor, _formFor: formFor, _densityFor: densityFor,
+    _motionFor: motionFor, _budgetFor: budgetFor,
+  };
+})();
+
+if (typeof module !== 'undefined' && module.exports) module.exports = DL.device;
+
+
 /* ── src/protocol.js ── */
 /* Wire protocol. Control messages are JSON strings; payload is binary frames
    belonging to whichever item was last announced with `begin`.
@@ -183,6 +390,8 @@ DL.protocol = (function () {
     DONE:     'done',
     HOLD:     'hold',      // receiver is behind — stop sending
     GO:       'go',
+    AUTH:     'auth',     // here is my nonce, prove you hold the secret
+    PROOF:    'proof',
     BYE:      'bye',
   };
 
@@ -215,6 +424,8 @@ DL.protocol = (function () {
   const hold    = () => JSON.stringify({ t: T.HOLD });
   const go      = () => JSON.stringify({ t: T.GO });
   const bye     = () => JSON.stringify({ t: T.BYE });
+  const auth    = (nonce) => JSON.stringify({ t: T.AUTH, nonce });
+  const proof   = (value) => JSON.stringify({ t: T.PROOF, value });
   const text    = (itemId, body) => JSON.stringify({ t: T.TEXT, itemId, body });
 
   // Never let a malformed or hostile message throw inside an event handler.
@@ -245,7 +456,7 @@ DL.protocol = (function () {
 
   return {
     VERSION, T, hello, manifest, accept, decline, begin, end, done,
-    hold, go, bye, text, parse, totalBytes,
+    hold, go, bye, auth, proof, text, parse, totalBytes,
   };
 })();
 
@@ -272,7 +483,7 @@ DL.transfer = (function () {
   // so sealing periodically keeps the heap flat however large the file is.
   function sealingSink(mime, onFinished) {
     const sealed = [];
-    const limit = DL.util.sealSize(typeof navigator !== 'undefined' ? navigator.deviceMemory : 4);
+    const limit = DL.device.profile.seal;
     let pending = [];
     let bytesPending = 0;
 
@@ -321,7 +532,10 @@ DL.transfer = (function () {
 
   async function pumpFile(conn, file, opts) {
     const sctp = conn.peerConnection && conn.peerConnection.sctp;
-    const size = DL.util.chunkSize(sctp && sctp.maxMessageSize);
+    const size = Math.min(
+      DL.util.chunkSize(sctp && sctp.maxMessageSize),
+      DL.device.profile.chunkCap,
+    );
     const high = Math.max(1 << 20, size * 8);
     const channel = conn.dataChannel;
 
@@ -436,7 +650,7 @@ var DL = (typeof DL !== 'undefined') ? DL : {};
 DL.session = (function () {
   const P = DL.protocol;
   const ID_PREFIX = 'dropline-';
-  const RECV_WATERMARK = 4 * 1024 * 1024;
+
   const RETRY_DELAYS = [800, 1600, 3200, 6000, 10000];
 
   const DEFAULT_ICE = [
@@ -477,14 +691,46 @@ DL.session = (function () {
     return opts;
   }
 
+  const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
   function newSessionId() {
-    return DL.util.newId(ID_PREFIX, (n) => crypto.getRandomValues(new Uint8Array(n)));
+    return DL.util.newId(ID_PREFIX, rand);
+  }
+
+  // The fragment is never sent to a server, so a secret placed there is shared
+  // by the two people holding the link and by nobody else -- including the
+  // broker, which only ever learns the peer id.
+  function newSecret() {
+    return Array.from(rand(16), (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
+
+  async function digest(text) {
+    const data = new TextEncoder().encode(text);
+    return hex(await crypto.subtle.digest('SHA-256', data));
+  }
+
+  // Short, human-comparable confirmation that both ends hold the same secret.
+  async function shortCode(secret) {
+    const d = await digest(`dropline-code:${secret}`);
+    const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+    let out = '';
+    for (let i = 0; i < 4; i++) out += alphabet[parseInt(d.slice(i * 2, i * 2 + 2), 16) % alphabet.length];
+    return out;
   }
 
   function create(options) {
     const on = options.on || {};
     const isHost = options.role === 'host';
     const hostId = isHost ? newSessionId() : options.hostId;
+    const secret = isHost ? newSecret() : (options.secret || null);
+
+    // With no secret in the link (an older link, or one hand-edited) the
+    // session still works but cannot be authenticated. Say so rather than
+    // implying a guarantee that is not there.
+    let authed = !secret;
+    let myNonce = null;
 
     let peer = null;
     let conn = null;
@@ -530,7 +776,7 @@ DL.session = (function () {
 
       peer.on('open', () => {
         if (isHost) {
-          emit('link', `${location.origin}${location.pathname}#${hostId}`, hostId);
+          emit('link', `${location.origin}${location.pathname}#${hostId}~${secret}`, hostId);
           emit('status', 'waiting');
         } else {
           dial();
@@ -581,12 +827,22 @@ DL.session = (function () {
       conn = c;
       let chain = Promise.resolve();
 
-      c.on('open', () => {
+      c.on('open', async () => {
         retry = 0;
         helloSeen = false;
+        authed = !secret;
         gate.release();
         c.send(P.hello(options.name || 'someone'));
+
+        if (secret) {
+          myNonce = newSecret();
+          c.send(P.auth(myNonce));
+          emit('code', await shortCode(secret));
+        }
+
         emit('status', 'connected');
+        describeLink().then((link) => { if (link) emit('link-quality', link); });
+        setTimeout(() => describeLink().then((l) => { if (l) emit('link-quality', l); }), 2500);
         pump(); // anything queued while disconnected
       });
 
@@ -621,6 +877,35 @@ DL.session = (function () {
       sending = false;
     }
 
+    async function describeLink() {
+      try {
+        const pc = conn && conn.peerConnection;
+        if (!pc || !pc.getStats) return null;
+        const stats = await pc.getStats();
+        let pair = null;
+        stats.forEach((r) => {
+          if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r;
+        });
+        if (!pair) return null;
+        let local = null;
+        let remote = null;
+        stats.forEach((r) => {
+          if (r.id === pair.localCandidateId) local = r;
+          if (r.id === pair.remoteCandidateId) remote = r;
+        });
+        const relayed = (local && local.candidateType === 'relay')
+          || (remote && remote.candidateType === 'relay');
+        return {
+          relayed: !!relayed,
+          rtt: typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime : null,
+          localType: local ? local.candidateType : null,
+          remoteType: remote ? remote.candidateType : null,
+        };
+      } catch {
+        return null;
+      }
+    }
+
     /* ── inbound ── */
 
     async function route(raw) {
@@ -645,10 +930,30 @@ DL.session = (function () {
           emit('peer', { name: msg.name, version: msg.v });
           break;
 
+        case P.T.AUTH:
+          if (secret && typeof msg.nonce === 'string') {
+            send(P.proof(await digest(`${secret}:${msg.nonce}`)));
+          }
+          break;
+
+        case P.T.PROOF: {
+          if (!secret || !myNonce) break;
+          const want = await digest(`${secret}:${myNonce}`);
+          if (msg.value === want) {
+            authed = true;
+            emit('authenticated', true);
+          } else {
+            emit('error', 'The other device could not prove it has this link. Disconnecting.');
+            close();
+          }
+          break;
+        }
+
         case P.T.HOLD: gate.hold(); break;
         case P.T.GO:   gate.release(); break;
 
         case P.T.MANIFEST:
+          if (!authed) { send(P.decline(msg.batchId, 'unauthenticated')); break; }
           offer = {
             batchId: msg.batchId,
             items: msg.items.map((it) => ({ ...it, dir: 'in', state: 'offered', done: 0 })),
@@ -705,13 +1010,13 @@ DL.session = (function () {
       let sink = null;
       const readable = new ReadableStream(
         { start(c) { sink = c; } },
-        new ByteLengthQueuingStrategy({ highWaterMark: RECV_WATERMARK }),
+        new ByteLengthQueuingStrategy({ highWaterMark: DL.device.profile.watermark }),
       );
       incoming.sink = sink;
       inbound.sink = sink;
       inbound.held = false;
 
-      const tick = DL.util.throttle(() => emit('item', { ...item }), 70);
+      const tick = DL.util.throttle(() => emit('item', { ...item }), DL.device.profile.repaintMs);
 
       item.crc = DL.util.crcInit();
 
@@ -923,11 +1228,24 @@ DL.session = (function () {
     return {
       sendFiles, sendText, acceptOffer, declineOffer, close,
       get hostId() { return hostId; },
+      get secret() { return secret; },
+      get authenticated() { return authed; },
+      describeLink,
       get connected() { return live() && helloSeen; },
     };
   }
 
-  return { create, ID_PREFIX, newSessionId, DEFAULT_ICE };
+  // `#dropline-<id>~<secret>` — the secret half never leaves the browser.
+  function parseHash(hash) {
+    const raw = String(hash || '').replace(/^#/, '');
+    if (!raw.startsWith(ID_PREFIX)) return null;
+    const cut = raw.indexOf('~');
+    return cut === -1
+      ? { hostId: raw, secret: null }
+      : { hostId: raw.slice(0, cut), secret: raw.slice(cut + 1) || null };
+  }
+
+  return { create, ID_PREFIX, newSessionId, newSecret, shortCode, parseHash, DEFAULT_ICE };
 })();
 
 
@@ -953,7 +1271,8 @@ DL.ui = (function () {
     'offer-accept', 'offer-decline', 'drop', 'file-input', 'folder-input',
     'act-files', 'act-folder', 'act-text', 'auto-accept', 'text-wrap', 'text-input',
     'send-text', 'transfer-list', 'empty-note', 'session-stats', 'error-msg',
-    'error-reset', 'veil'];
+    'error-reset', 'veil', 'verify-code', 'verify-wrap', 'link-quality',
+    'theme-btn', 'install-btn', 'device-note'];
 
   const key = (id) => id.replace(/-(\w)/g, (_, c) => c.toUpperCase());
 
@@ -1255,6 +1574,7 @@ DL.ui = (function () {
   // A received image is far more recognisable than its filename.
   function renderThumb(row, item) {
     if (item.dir !== 'in' || item.state !== 'done' || !item.blob) return;
+    if (!DL.device.profile.thumbnails) return;
     if (!/^image\//.test(item.mime || '') || row.querySelector('.item-thumb')) return;
     const url = URL.createObjectURL(item.blob);
     objectUrls.push(url);
@@ -1437,6 +1757,7 @@ DL.ui = (function () {
       if (e.key === 'Escape' && !el.offerCard.hidden) declineOffer();
     });
 
+    if (el.themeBtn) el.themeBtn.addEventListener('click', cycleTheme);
     el.errorReset.addEventListener('click', () => { location.href = location.pathname; });
 
     window.addEventListener('beforeunload', (e) => {
@@ -1469,24 +1790,45 @@ DL.ui = (function () {
 
   function boot() {
     IDS.forEach((id) => { el[key(id)] = $(id); });
-    wire();
 
-    const hash = location.hash.slice(1);
-    const isGuest = hash.startsWith(DL.session.ID_PREFIX);
+    // Decide what this machine is before anything is drawn, so the first
+    // paint is already the right shape rather than reflowing into it.
+    const profile = DL.device.init();
+    DL.device.onChange(applyProfile);
+    applyProfile(profile);
+
+    applyStoredTheme();
+    wire();
+    wireInstall();
+    registerWorker();
+
+    const parsed = DL.session.parseHash(location.hash);
+    const isGuest = !!parsed;
 
     show(isGuest ? 'session' : 'invite');
     setStatus(isGuest ? 'connecting' : 'idle');
 
-    if (isGuest) el.shareLink.value = `${location.origin}${location.pathname}#${hash}`;
+    if (isGuest) {
+      el.shareLink.value = `${location.origin}${location.pathname}${location.hash}`;
+      if (parsed.secret) {
+        DL.session.shortCode(parsed.secret).then(showCode);
+      } else {
+        showUnverified();
+      }
+    }
 
     session = DL.session.create({
       role: isGuest ? 'guest' : 'host',
-      hostId: isGuest ? hash : null,
+      hostId: isGuest ? parsed.hostId : null,
+      secret: isGuest ? parsed.secret : null,
       on: {
         link(url) { el.shareLink.value = url; drawQr(url); },
         status: setStatus,
         offer: showOffer,
         item: upsert,
+        code: showCode,
+        authenticated: markAuthenticated,
+        'link-quality': showLinkQuality,
         error(msg) {
           if (connState === 'failed') fail(msg);
           else announce(msg);
@@ -1495,6 +1837,99 @@ DL.ui = (function () {
     });
 
     DL.session.active = session;
+  }
+
+  /* ── device profile → interface ── */
+
+  function applyProfile(p) {
+    if (el.deviceNote) el.deviceNote.textContent = p.describe();
+    if (el.qr) { el.qr.style.width = `${p.qrPixels}px`; el.qr.style.height = `${p.qrPixels}px`; }
+  }
+
+  /* ── verification ── */
+
+  function showCode(code) {
+    if (!el.verifyCode) return;
+    el.verifyWrap.hidden = false;
+    el.verifyCode.textContent = code;
+  }
+
+  function markAuthenticated() {
+    if (!el.verifyWrap) return;
+    el.verifyWrap.dataset.state = 'verified';
+    announce('Both devices verified');
+  }
+
+  function showUnverified() {
+    if (!el.verifyWrap) return;
+    el.verifyWrap.hidden = false;
+    el.verifyWrap.dataset.state = 'unverified';
+    el.verifyCode.textContent = '—';
+  }
+
+  function showLinkQuality(link) {
+    if (!el.linkQuality) return;
+    const ms = link.rtt !== null ? ` · ${Math.round(link.rtt * 1000)} ms` : '';
+    el.linkQuality.hidden = false;
+    el.linkQuality.textContent = (link.relayed ? 'Relayed' : 'Direct connection') + ms;
+    el.linkQuality.dataset.relayed = String(link.relayed);
+  }
+
+  /* ── theme ── */
+
+  const THEMES = ['system', 'light', 'dark'];
+
+  function applyStoredTheme() {
+    let saved = 'system';
+    try { saved = localStorage.getItem('dropline-theme') || 'system'; } catch { /* private mode */ }
+    setTheme(THEMES.includes(saved) ? saved : 'system', false);
+  }
+
+  function setTheme(name, save) {
+    document.documentElement.dataset.theme = name;
+    if (el.themeBtn) {
+      el.themeBtn.textContent = name === 'system' ? 'Theme: auto' : `Theme: ${name}`;
+      el.themeBtn.setAttribute('aria-label', `Theme: ${name}. Click to change.`);
+    }
+    if (save !== false) {
+      try { localStorage.setItem('dropline-theme', name); } catch { /* private mode */ }
+    }
+  }
+
+  function cycleTheme() {
+    const current = document.documentElement.dataset.theme || 'system';
+    setTheme(THEMES[(THEMES.indexOf(current) + 1) % THEMES.length], true);
+  }
+
+  /* ── offline shell ──
+     Safe to cache only because the build fingerprints its own output; see
+     sw.js for why HTML and config stay network-first. */
+
+  function registerWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost') return;
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+
+  /* ── install ── */
+
+  let installPrompt = null;
+
+  function wireInstall() {
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      installPrompt = e;
+      if (el.installBtn) el.installBtn.hidden = false;
+    });
+    if (el.installBtn) {
+      el.installBtn.addEventListener('click', async () => {
+        if (!installPrompt) return;
+        installPrompt.prompt();
+        await installPrompt.userChoice.catch(() => {});
+        installPrompt = null;
+        el.installBtn.hidden = true;
+      });
+    }
   }
 
   return { boot, upsert, setStatus, announce };

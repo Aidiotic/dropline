@@ -13,11 +13,14 @@ const assert = require('assert');
 
 // src/util.js and src/protocol.js are written to avoid browser globals at load
 // time precisely so they can be evaluated here.
-const context = vm.createContext({ console, Date, Math, JSON, String, Number, Array, Object });
-for (const file of ['util.js', 'protocol.js']) {
+const context = vm.createContext({
+  console, Date, Math, JSON, String, Number, Array, Object,
+  Uint8Array, Uint32Array, TextEncoder,
+});
+for (const file of ['util.js', 'device.js', 'protocol.js']) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'src', file), 'utf8'), context);
 }
-const { util, protocol } = context.DL;
+const { util, protocol, device } = context.DL;
 
 let passed = 0;
 let failed = 0;
@@ -233,6 +236,84 @@ test('moves toward the new sample without jumping to it', () => {
 });
 test('recovers from a non-finite previous value', () => {
   assert.strictEqual(util.ema(NaN, 7, 0.3), 7);
+});
+
+/* ── device profiling ── */
+
+const sig = (over) => Object.assign({
+  memory: 4, cores: 4, effectiveType: '4g', downlink: 10, rtt: 50,
+  saveData: false, coarse: false, hover: true, reduceMotion: false,
+  width: 1400, height: 900, landscape: true, dpr: 2,
+  battery: { level: null, charging: null },
+}, over);
+
+group('device.tier');
+test('a capable machine on a fast link is high', () => {
+  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 8 })), 'high');
+});
+test('a weak machine on a slow link is low', () => {
+  assert.strictEqual(device._tierFor(sig({ memory: 2, cores: 2, effectiveType: '2g' })), 'low');
+});
+test('save-data alone drops the tier, whatever the hardware', () => {
+  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 8, saveData: true })), 'mid');
+});
+test('a mid-range machine is not flattered into the top tier', () => {
+  assert.strictEqual(device._tierFor(sig({ memory: 4, cores: 4 })), 'mid');
+});
+test('a draining battery pushes a borderline device down a tier', () => {
+  // Penalises the score rather than overriding it: plenty of headroom absorbs
+  // it, a marginal device does not.
+  const marginal = sig({ memory: 4, cores: 2 });
+  assert.strictEqual(device._tierFor(marginal), 'mid');
+  assert.strictEqual(
+    device._tierFor({ ...marginal, battery: { level: 0.1, charging: false } }), 'low');
+});
+test('a draining battery cuts motion even on capable hardware', () => {
+  const flat = sig({ memory: 8, cores: 8, battery: { level: 0.1, charging: false } });
+  assert.strictEqual(device._tierFor(flat), 'mid', 'top-tier hardware steps down one');
+  assert.strictEqual(device._motionFor(flat, 'high'), 'minimal', 'and stops animating');
+});
+test('charging removes the battery penalty entirely', () => {
+  const charging = sig({ memory: 8, cores: 8, battery: { level: 0.1, charging: true } });
+  assert.strictEqual(device._tierFor(charging), 'high');
+  assert.strictEqual(device._motionFor(charging, 'high'), 'full');
+});
+test('unknown hardware lands in the middle rather than assuming the worst', () => {
+  assert.strictEqual(device._tierFor(sig({ memory: null, cores: null })), 'mid');
+});
+
+group('device.form');
+test('reads form factor from width', () => {
+  assert.strictEqual(device._formFor(sig({ width: 390 })), 'phone');
+  assert.strictEqual(device._formFor(sig({ width: 800 })), 'tablet');
+  assert.strictEqual(device._formFor(sig({ width: 1400 })), 'desktop');
+});
+test('a wide touch screen without hover is treated as a tablet', () => {
+  assert.strictEqual(device._formFor(sig({ width: 1100, coarse: true, hover: false })), 'tablet');
+});
+
+group('device.motion');
+test('an explicit reduced-motion preference always wins', () => {
+  assert.strictEqual(device._motionFor(sig({ reduceMotion: true }), 'high'), 'none');
+});
+test('low-end and data-saving devices get minimal motion', () => {
+  assert.strictEqual(device._motionFor(sig(), 'low'), 'minimal');
+  assert.strictEqual(device._motionFor(sig({ saveData: true }), 'high'), 'minimal');
+});
+
+group('device.budget');
+test('budgets grow with the tier and never invert', () => {
+  const low = device._budgetFor('low', sig());
+  const high = device._budgetFor('high', sig());
+  assert.ok(low.seal < high.seal);
+  assert.ok(low.watermark < high.watermark);
+  assert.ok(low.chunkCap < high.chunkCap);
+  assert.ok(low.repaintMs > high.repaintMs, 'low tier should repaint less often');
+});
+test('thumbnails are dropped on low-end and data-saving devices', () => {
+  assert.strictEqual(device._budgetFor('low', sig()).thumbnails, false);
+  assert.strictEqual(device._budgetFor('high', sig({ saveData: true })).thumbnails, false);
+  assert.strictEqual(device._budgetFor('high', sig()).thumbnails, true);
 });
 
 /* ── protocol ── */

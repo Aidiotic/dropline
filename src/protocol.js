@@ -19,6 +19,8 @@ DL.protocol = (function () {
     DONE:     'done',
     HOLD:     'hold',      // receiver is behind — stop sending
     GO:       'go',
+    AUTH:     'auth',     // here is my nonce, prove you hold the secret
+    PROOF:    'proof',
     BYE:      'bye',
   };
 
@@ -51,6 +53,8 @@ DL.protocol = (function () {
   const hold    = () => JSON.stringify({ t: T.HOLD });
   const go      = () => JSON.stringify({ t: T.GO });
   const bye     = () => JSON.stringify({ t: T.BYE });
+  const auth    = (nonce) => JSON.stringify({ t: T.AUTH, nonce });
+  const proof   = (value) => JSON.stringify({ t: T.PROOF, value });
   const text    = (itemId, body) => JSON.stringify({ t: T.TEXT, itemId, body });
 
   // Never let a malformed or hostile message throw inside an event handler.
@@ -81,7 +85,7 @@ DL.protocol = (function () {
 
   return {
     VERSION, T, hello, manifest, accept, decline, begin, end, done,
-    hold, go, bye, text, parse, totalBytes,
+    hold, go, bye, auth, proof, text, parse, totalBytes,
   };
 })();
 

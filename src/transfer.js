@@ -17,7 +17,7 @@ DL.transfer = (function () {
   // so sealing periodically keeps the heap flat however large the file is.
   function sealingSink(mime, onFinished) {
     const sealed = [];
-    const limit = DL.util.sealSize(typeof navigator !== 'undefined' ? navigator.deviceMemory : 4);
+    const limit = DL.device.profile.seal;
     let pending = [];
     let bytesPending = 0;
 
@@ -66,7 +66,10 @@ DL.transfer = (function () {
 
   async function pumpFile(conn, file, opts) {
     const sctp = conn.peerConnection && conn.peerConnection.sctp;
-    const size = DL.util.chunkSize(sctp && sctp.maxMessageSize);
+    const size = Math.min(
+      DL.util.chunkSize(sctp && sctp.maxMessageSize),
+      DL.device.profile.chunkCap,
+    );
     const high = Math.max(1 << 20, size * 8);
     const channel = conn.dataChannel;
 

@@ -6,7 +6,7 @@ var DL = (typeof DL !== 'undefined') ? DL : {};
 DL.session = (function () {
   const P = DL.protocol;
   const ID_PREFIX = 'dropline-';
-  const RECV_WATERMARK = 4 * 1024 * 1024;
+
   const RETRY_DELAYS = [800, 1600, 3200, 6000, 10000];
 
   const DEFAULT_ICE = [
@@ -47,14 +47,46 @@ DL.session = (function () {
     return opts;
   }
 
+  const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
   function newSessionId() {
-    return DL.util.newId(ID_PREFIX, (n) => crypto.getRandomValues(new Uint8Array(n)));
+    return DL.util.newId(ID_PREFIX, rand);
+  }
+
+  // The fragment is never sent to a server, so a secret placed there is shared
+  // by the two people holding the link and by nobody else -- including the
+  // broker, which only ever learns the peer id.
+  function newSecret() {
+    return Array.from(rand(16), (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
+
+  async function digest(text) {
+    const data = new TextEncoder().encode(text);
+    return hex(await crypto.subtle.digest('SHA-256', data));
+  }
+
+  // Short, human-comparable confirmation that both ends hold the same secret.
+  async function shortCode(secret) {
+    const d = await digest(`dropline-code:${secret}`);
+    const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+    let out = '';
+    for (let i = 0; i < 4; i++) out += alphabet[parseInt(d.slice(i * 2, i * 2 + 2), 16) % alphabet.length];
+    return out;
   }
 
   function create(options) {
     const on = options.on || {};
     const isHost = options.role === 'host';
     const hostId = isHost ? newSessionId() : options.hostId;
+    const secret = isHost ? newSecret() : (options.secret || null);
+
+    // With no secret in the link (an older link, or one hand-edited) the
+    // session still works but cannot be authenticated. Say so rather than
+    // implying a guarantee that is not there.
+    let authed = !secret;
+    let myNonce = null;
 
     let peer = null;
     let conn = null;
@@ -100,7 +132,7 @@ DL.session = (function () {
 
       peer.on('open', () => {
         if (isHost) {
-          emit('link', `${location.origin}${location.pathname}#${hostId}`, hostId);
+          emit('link', `${location.origin}${location.pathname}#${hostId}~${secret}`, hostId);
           emit('status', 'waiting');
         } else {
           dial();
@@ -151,12 +183,22 @@ DL.session = (function () {
       conn = c;
       let chain = Promise.resolve();
 
-      c.on('open', () => {
+      c.on('open', async () => {
         retry = 0;
         helloSeen = false;
+        authed = !secret;
         gate.release();
         c.send(P.hello(options.name || 'someone'));
+
+        if (secret) {
+          myNonce = newSecret();
+          c.send(P.auth(myNonce));
+          emit('code', await shortCode(secret));
+        }
+
         emit('status', 'connected');
+        describeLink().then((link) => { if (link) emit('link-quality', link); });
+        setTimeout(() => describeLink().then((l) => { if (l) emit('link-quality', l); }), 2500);
         pump(); // anything queued while disconnected
       });
 
@@ -191,6 +233,35 @@ DL.session = (function () {
       sending = false;
     }
 
+    async function describeLink() {
+      try {
+        const pc = conn && conn.peerConnection;
+        if (!pc || !pc.getStats) return null;
+        const stats = await pc.getStats();
+        let pair = null;
+        stats.forEach((r) => {
+          if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r;
+        });
+        if (!pair) return null;
+        let local = null;
+        let remote = null;
+        stats.forEach((r) => {
+          if (r.id === pair.localCandidateId) local = r;
+          if (r.id === pair.remoteCandidateId) remote = r;
+        });
+        const relayed = (local && local.candidateType === 'relay')
+          || (remote && remote.candidateType === 'relay');
+        return {
+          relayed: !!relayed,
+          rtt: typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime : null,
+          localType: local ? local.candidateType : null,
+          remoteType: remote ? remote.candidateType : null,
+        };
+      } catch {
+        return null;
+      }
+    }
+
     /* ── inbound ── */
 
     async function route(raw) {
@@ -215,10 +286,30 @@ DL.session = (function () {
           emit('peer', { name: msg.name, version: msg.v });
           break;
 
+        case P.T.AUTH:
+          if (secret && typeof msg.nonce === 'string') {
+            send(P.proof(await digest(`${secret}:${msg.nonce}`)));
+          }
+          break;
+
+        case P.T.PROOF: {
+          if (!secret || !myNonce) break;
+          const want = await digest(`${secret}:${myNonce}`);
+          if (msg.value === want) {
+            authed = true;
+            emit('authenticated', true);
+          } else {
+            emit('error', 'The other device could not prove it has this link. Disconnecting.');
+            close();
+          }
+          break;
+        }
+
         case P.T.HOLD: gate.hold(); break;
         case P.T.GO:   gate.release(); break;
 
         case P.T.MANIFEST:
+          if (!authed) { send(P.decline(msg.batchId, 'unauthenticated')); break; }
           offer = {
             batchId: msg.batchId,
             items: msg.items.map((it) => ({ ...it, dir: 'in', state: 'offered', done: 0 })),
@@ -275,13 +366,13 @@ DL.session = (function () {
       let sink = null;
       const readable = new ReadableStream(
         { start(c) { sink = c; } },
-        new ByteLengthQueuingStrategy({ highWaterMark: RECV_WATERMARK }),
+        new ByteLengthQueuingStrategy({ highWaterMark: DL.device.profile.watermark }),
       );
       incoming.sink = sink;
       inbound.sink = sink;
       inbound.held = false;
 
-      const tick = DL.util.throttle(() => emit('item', { ...item }), 70);
+      const tick = DL.util.throttle(() => emit('item', { ...item }), DL.device.profile.repaintMs);
 
       item.crc = DL.util.crcInit();
 
@@ -493,9 +584,22 @@ DL.session = (function () {
     return {
       sendFiles, sendText, acceptOffer, declineOffer, close,
       get hostId() { return hostId; },
+      get secret() { return secret; },
+      get authenticated() { return authed; },
+      describeLink,
       get connected() { return live() && helloSeen; },
     };
   }
 
-  return { create, ID_PREFIX, newSessionId, DEFAULT_ICE };
+  // `#dropline-<id>~<secret>` — the secret half never leaves the browser.
+  function parseHash(hash) {
+    const raw = String(hash || '').replace(/^#/, '');
+    if (!raw.startsWith(ID_PREFIX)) return null;
+    const cut = raw.indexOf('~');
+    return cut === -1
+      ? { hostId: raw, secret: null }
+      : { hostId: raw.slice(0, cut), secret: raw.slice(cut + 1) || null };
+  }
+
+  return { create, ID_PREFIX, newSessionId, newSecret, shortCode, parseHash, DEFAULT_ICE };
 })();

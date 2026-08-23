@@ -19,7 +19,8 @@ DL.ui = (function () {
     'offer-accept', 'offer-decline', 'drop', 'file-input', 'folder-input',
     'act-files', 'act-folder', 'act-text', 'auto-accept', 'text-wrap', 'text-input',
     'send-text', 'transfer-list', 'empty-note', 'session-stats', 'error-msg',
-    'error-reset', 'veil'];
+    'error-reset', 'veil', 'verify-code', 'verify-wrap', 'link-quality',
+    'theme-btn', 'install-btn', 'device-note'];
 
   const key = (id) => id.replace(/-(\w)/g, (_, c) => c.toUpperCase());
 
@@ -321,6 +322,7 @@ DL.ui = (function () {
   // A received image is far more recognisable than its filename.
   function renderThumb(row, item) {
     if (item.dir !== 'in' || item.state !== 'done' || !item.blob) return;
+    if (!DL.device.profile.thumbnails) return;
     if (!/^image\//.test(item.mime || '') || row.querySelector('.item-thumb')) return;
     const url = URL.createObjectURL(item.blob);
     objectUrls.push(url);
@@ -503,6 +505,7 @@ DL.ui = (function () {
       if (e.key === 'Escape' && !el.offerCard.hidden) declineOffer();
     });
 
+    if (el.themeBtn) el.themeBtn.addEventListener('click', cycleTheme);
     el.errorReset.addEventListener('click', () => { location.href = location.pathname; });
 
     window.addEventListener('beforeunload', (e) => {
@@ -535,24 +538,45 @@ DL.ui = (function () {
 
   function boot() {
     IDS.forEach((id) => { el[key(id)] = $(id); });
-    wire();
 
-    const hash = location.hash.slice(1);
-    const isGuest = hash.startsWith(DL.session.ID_PREFIX);
+    // Decide what this machine is before anything is drawn, so the first
+    // paint is already the right shape rather than reflowing into it.
+    const profile = DL.device.init();
+    DL.device.onChange(applyProfile);
+    applyProfile(profile);
+
+    applyStoredTheme();
+    wire();
+    wireInstall();
+    registerWorker();
+
+    const parsed = DL.session.parseHash(location.hash);
+    const isGuest = !!parsed;
 
     show(isGuest ? 'session' : 'invite');
     setStatus(isGuest ? 'connecting' : 'idle');
 
-    if (isGuest) el.shareLink.value = `${location.origin}${location.pathname}#${hash}`;
+    if (isGuest) {
+      el.shareLink.value = `${location.origin}${location.pathname}${location.hash}`;
+      if (parsed.secret) {
+        DL.session.shortCode(parsed.secret).then(showCode);
+      } else {
+        showUnverified();
+      }
+    }
 
     session = DL.session.create({
       role: isGuest ? 'guest' : 'host',
-      hostId: isGuest ? hash : null,
+      hostId: isGuest ? parsed.hostId : null,
+      secret: isGuest ? parsed.secret : null,
       on: {
         link(url) { el.shareLink.value = url; drawQr(url); },
         status: setStatus,
         offer: showOffer,
         item: upsert,
+        code: showCode,
+        authenticated: markAuthenticated,
+        'link-quality': showLinkQuality,
         error(msg) {
           if (connState === 'failed') fail(msg);
           else announce(msg);
@@ -561,6 +585,99 @@ DL.ui = (function () {
     });
 
     DL.session.active = session;
+  }
+
+  /* ── device profile → interface ── */
+
+  function applyProfile(p) {
+    if (el.deviceNote) el.deviceNote.textContent = p.describe();
+    if (el.qr) { el.qr.style.width = `${p.qrPixels}px`; el.qr.style.height = `${p.qrPixels}px`; }
+  }
+
+  /* ── verification ── */
+
+  function showCode(code) {
+    if (!el.verifyCode) return;
+    el.verifyWrap.hidden = false;
+    el.verifyCode.textContent = code;
+  }
+
+  function markAuthenticated() {
+    if (!el.verifyWrap) return;
+    el.verifyWrap.dataset.state = 'verified';
+    announce('Both devices verified');
+  }
+
+  function showUnverified() {
+    if (!el.verifyWrap) return;
+    el.verifyWrap.hidden = false;
+    el.verifyWrap.dataset.state = 'unverified';
+    el.verifyCode.textContent = '—';
+  }
+
+  function showLinkQuality(link) {
+    if (!el.linkQuality) return;
+    const ms = link.rtt !== null ? ` · ${Math.round(link.rtt * 1000)} ms` : '';
+    el.linkQuality.hidden = false;
+    el.linkQuality.textContent = (link.relayed ? 'Relayed' : 'Direct connection') + ms;
+    el.linkQuality.dataset.relayed = String(link.relayed);
+  }
+
+  /* ── theme ── */
+
+  const THEMES = ['system', 'light', 'dark'];
+
+  function applyStoredTheme() {
+    let saved = 'system';
+    try { saved = localStorage.getItem('dropline-theme') || 'system'; } catch { /* private mode */ }
+    setTheme(THEMES.includes(saved) ? saved : 'system', false);
+  }
+
+  function setTheme(name, save) {
+    document.documentElement.dataset.theme = name;
+    if (el.themeBtn) {
+      el.themeBtn.textContent = name === 'system' ? 'Theme: auto' : `Theme: ${name}`;
+      el.themeBtn.setAttribute('aria-label', `Theme: ${name}. Click to change.`);
+    }
+    if (save !== false) {
+      try { localStorage.setItem('dropline-theme', name); } catch { /* private mode */ }
+    }
+  }
+
+  function cycleTheme() {
+    const current = document.documentElement.dataset.theme || 'system';
+    setTheme(THEMES[(THEMES.indexOf(current) + 1) % THEMES.length], true);
+  }
+
+  /* ── offline shell ──
+     Safe to cache only because the build fingerprints its own output; see
+     sw.js for why HTML and config stay network-first. */
+
+  function registerWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost') return;
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+
+  /* ── install ── */
+
+  let installPrompt = null;
+
+  function wireInstall() {
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      installPrompt = e;
+      if (el.installBtn) el.installBtn.hidden = false;
+    });
+    if (el.installBtn) {
+      el.installBtn.addEventListener('click', async () => {
+        if (!installPrompt) return;
+        installPrompt.prompt();
+        await installPrompt.userChoice.catch(() => {});
+        installPrompt = null;
+        el.installBtn.hidden = true;
+      });
+    }
   }
 
   return { boot, upsert, setStatus, announce };
