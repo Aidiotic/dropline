@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <title>dropline</title>
 <meta name="description" content="Send files straight between two browsers. Nothing is uploaded, nothing is stored.">
-<link rel="stylesheet" href="style.6adf29d9e7.css">
+<link rel="stylesheet" href="style.002deb141d.css">
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#F0EEE6" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#171615" media="(prefers-color-scheme: dark)">
@@ -38,11 +38,11 @@
         <button id="share-btn" type="button" class="act" hidden>Share</button>
       </div>
     </div>
-    <p class="hint">Open the link on the other device, or scan the code.</p>
+    <p class="hint">Open this on your other device.</p>
     <div class="verify" id="verify-wrap" hidden>
       <span class="verify-label">Verification code</span>
       <span class="verify-code" id="verify-code">····</span>
-      <span class="verify-note">Both devices must show the same code.</span>
+      <span class="verify-note">Both devices should show this.</span>
     </div>
   </section>
 
@@ -59,16 +59,13 @@
 
     <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose files to send">
       <span class="drop-title">Drop anything</span>
-      <span class="drop-sub">files, a folder, or paste an image</span>
+      <span class="drop-sub">or paste · or use the buttons below</span>
     </div>
 
     <div class="row row-acts">
       <button id="act-files" type="button" class="act">Files</button>
       <button id="act-folder" type="button" class="act">Folder</button>
       <button id="act-text" type="button" class="act" aria-expanded="false">Text</button>
-      <label class="auto" title="Skip the accept step for this session">
-        <input type="checkbox" id="auto-accept"> auto-accept
-      </label>
     </div>
 
     <div id="text-wrap" class="text-wrap" hidden>
@@ -80,7 +77,7 @@
     <input type="file" id="folder-input" webkitdirectory directory hidden>
 
     <ul class="list" id="transfer-list"></ul>
-    <p class="hint" id="empty-note">Anything either of you sends appears here.</p>
+    <p class="hint" id="empty-note">Anything either of you sends shows up here.</p>
     <p class="stats" id="session-stats" hidden></p>
   </section>
 
@@ -158,6 +155,6 @@
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"
         integrity="sha384-lQXOAyZwHXE55JFyrOMB7nY2Wv+m5ZWNtJcHrd1rceRQXAYNLak8ukN5TjBTcIwz"
         crossorigin="anonymous"></script>
-<script src="dropline.04014a245d.js"></script>
+<script src="dropline.6850fcf848.js"></script>
 </body>
 </html>

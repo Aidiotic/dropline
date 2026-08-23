@@ -1725,7 +1725,7 @@ DL.ui = (function () {
   const IDS = ['app', 'statusline', 'live', 'view-invite', 'view-session', 'view-error',
     'qr', 'share-link', 'copy-btn', 'share-btn', 'offer-card', 'offer-summary',
     'offer-accept', 'offer-decline', 'drop', 'file-input', 'folder-input',
-    'act-files', 'act-folder', 'act-text', 'auto-accept', 'text-wrap', 'text-input',
+    'act-files', 'act-folder', 'act-text', 'text-wrap', 'text-input',
     'send-text', 'transfer-list', 'empty-note', 'session-stats', 'error-msg',
     'error-reset', 'veil', 'verify-code', 'verify-wrap', 'link-quality',
     'install-btn', 'device-note', 'settings-btn', 'settings', 'pref-theme',
@@ -2146,11 +2146,6 @@ DL.ui = (function () {
       if (open) el.textInput.focus();
     });
 
-    el.autoAccept.addEventListener('change', () => {
-      autoAccept = el.autoAccept.checked;
-      announce(autoAccept ? 'Auto-accept on' : 'Auto-accept off');
-    });
-
     el.fileInput.addEventListener('change', () => {
       offerLocal(Array.from(el.fileInput.files).map((file) => ({ file, path: '' })));
       el.fileInput.value = '';
@@ -2365,7 +2360,6 @@ DL.ui = (function () {
 
     autoAccept = prefs.autoAccept;
     if (el.prefAutoaccept) el.prefAutoaccept.checked = prefs.autoAccept;
-    if (el.autoAccept) el.autoAccept.checked = prefs.autoAccept;
     if (el.laufeyChoice) el.laufeyChoice.hidden = !prefs.laufey;
 
     check(el.prefTheme, 'theme', prefs.theme);

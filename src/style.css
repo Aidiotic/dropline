@@ -666,13 +666,13 @@ code {
    Unlocked, not listed. Dusk colours: the clay square becomes a muted rose. */
 
 :root[data-theme="laufey"] {
-  --paper: #EFE8F1;
-  --raised: #E3D8E7;
-  --ink: #2A2233;
-  --muted: #6E6178;
-  --faint: #C4B4CB;
-  --rule: #DBCEE0;
-  --clay: #A96F8E;
+  --paper: #F3EAF3;
+  --raised: #E8DCEA;
+  --ink: #241B2E;
+  --muted: #695A75;
+  --faint: #C6B4CE;
+  --rule: #DDCEE2;
+  --clay: #9C5F82;
   --ok: #55786A;
   --bad: #9E4A57;
 }
