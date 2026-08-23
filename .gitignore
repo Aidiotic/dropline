@@ -1,2 +1,7 @@
 .DS_Store
 node_modules/
+
+# Wrangler's local cache holds the Cloudflare account id and account name.
+# It is machine-local state, not project source, and must never be published.
+.wrangler/
+worker/.wrangler/
