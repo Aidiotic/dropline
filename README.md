@@ -17,7 +17,8 @@ to pay for, and nothing to delete afterwards.
 - **Compresses in flight** when that helps, and skips it when it wouldn't.
 - **Reconnects** if the connection drops or a phone locks.
 - **Verifies both ends** hold the same link, and checksums every file.
-- **Adapts to the device** rather than assuming a fast desktop.
+- **Adapts to the device** rather than assuming a fast desktop — five tiers,
+  chosen partly by measuring what the machine actually does.
 
 A signalling server is used only to introduce the two browsers. It sees the
 session id and the connection handshake — never the files, never their names.
@@ -76,9 +77,14 @@ grew the receiver's heap by 118 MB.
 
 `src/device.js` is the only place that decides what the machine is. It scores
 the real capability signals — memory, cores, network type, data-saver, battery,
-pointer, viewport — into a tier, a form factor, a density and a motion level,
-and publishes them on `<html>` so CSS responds without JavaScript touching
-styles. Chunk cap, seal interval, receive watermark, repaint rate, thumbnails
+pointer, viewport — into one of five tiers, plus a form factor, a density and a motion
+level, and publishes them on `<html>` so CSS responds without JavaScript
+touching styles.
+
+The signals include a **measured** one, not just advertised ones: the browser
+times a checksum over a megabyte and scores the result. `deviceMemory` is coarse
+and may be clamped, so it cannot separate a netbook from a workstation — where
+the spec sheet and the stopwatch disagree, the stopwatch wins. Chunk cap, seal interval, receive watermark, repaint rate, thumbnails
 and animation all follow from it, and it is recomputed on resize, rotation,
 network change and battery change.
 

@@ -39,23 +39,6 @@
         </p>
       </li>
       <li>
-        <h3>Settings panel</h3>
-        <p>
-          Theme, motion, auto-accept and stripe count are decided for you or
-          buried. One compact panel should hold them, with the choices
-          remembered.
-        </p>
-      </li>
-      <li>
-        <h3>Finer performance tiers</h3>
-        <p>
-          Three tiers is coarse. A 2 GB machine and a 32-core workstation both
-          deserve their own settings, and <code>navigator.deviceMemory</code>
-          alone cannot tell them apart — a short runtime capability probe would
-          measure what the machine actually does rather than what it claims.
-        </p>
-      </li>
-      <li>
         <h3>Adaptive compression</h3>
         <p>
           Whether to compress is currently a guess from the file's type. Better
@@ -87,6 +70,46 @@
 
   <section class="panel">
     <h2 class="sect">Releases</h2>
+
+    <article class="rel">
+      <h3>v1.3 <time datetime="2026-08-23">23 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Five performance tiers</strong> rather than three, so a 2 GB
+          dual-core and a 24-core workstation no longer share a budget — from a
+          single data channel and 32 KB chunks at the bottom to six channels and
+          16 MB buffers at the top.
+        </li>
+        <li>
+          <strong>The tier is measured, not assumed.</strong>
+          <code>navigator.deviceMemory</code> is coarse and may be clamped, so
+          it cannot tell those two machines apart. Alongside it the browser now
+          times real work — a checksum over a megabyte, a couple of milliseconds
+          — and where the spec sheet and the stopwatch disagree, the stopwatch
+          wins. A machine claiming 8 GB that processes bytes slowly is demoted.
+          Taken as the best of three rounds, because one cold pass in a
+          background tab made a fast machine look slow.
+        </li>
+        <li>
+          <strong>A settings sheet</strong> for theme, motion, performance and
+          auto-accept, showing what was detected including the measured figure.
+          Choices survive a reload and are re-asserted after the device profile
+          recomputes, which writes the same attributes.
+        </li>
+        <li>
+          Auto-accept was in two places at once; it is a setting, so the main
+          view is three plain verbs again. Copy trimmed throughout.
+        </li>
+        <li>There is a theme that is not in the list.</li>
+      </ul>
+      <p class="credit">
+        Multi-file batches were arriving with only the first file intact: the
+        receiver restarts its per-channel counts at every item, but the sender
+        kept its round-robin position across the whole batch, so the second file
+        began on the wrong channel. The integrity checking is what surfaced it —
+        those files failed loudly rather than arriving quietly corrupted.
+      </p>
+    </article>
 
     <article class="rel">
       <h3>v1.2 <time datetime="2026-08-23">23 Aug 2026</time></h3>
