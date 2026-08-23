@@ -96,6 +96,40 @@ test('skips everything when the browser has no CompressionStream', () => {
   assert.strictEqual(util.shouldCompress('text/plain', 1e6, false), false);
 });
 
+group('util.worthCompressing');
+test('accepts a ratio that meaningfully shrinks the payload', () => {
+  assert.strictEqual(util.worthCompressing(0.1), true);
+  assert.strictEqual(util.worthCompressing(0.5), true);
+});
+test('rejects a ratio that barely helps, since both ends pay the CPU', () => {
+  assert.strictEqual(util.worthCompressing(0.95), false);
+  assert.strictEqual(util.worthCompressing(0.9), false);
+});
+test('rejects a ratio that would expand the payload', () => {
+  assert.strictEqual(util.worthCompressing(1.05), false);
+});
+test('rejects nonsense rather than guessing', () => {
+  assert.strictEqual(util.worthCompressing(NaN), false);
+  assert.strictEqual(util.worthCompressing(0), false);
+  assert.strictEqual(util.worthCompressing(-1), false);
+  assert.strictEqual(util.worthCompressing(undefined), false);
+});
+
+group('util.sampleWindow');
+test('takes the whole thing when it is smaller than the sample', () => {
+  sameList([util.sampleWindow(1000, 4096).start, util.sampleWindow(1000, 4096).end], [0, 1000]);
+});
+test('samples past the header rather than from the front', () => {
+  const w = util.sampleWindow(1000000, 1000);
+  assert.ok(w.start > 0, 'should skip the container header');
+  assert.strictEqual(w.end - w.start, 1000);
+});
+test('never reads past the end', () => {
+  const w = util.sampleWindow(1200, 1000);
+  assert.ok(w.end <= 1200);
+  assert.ok(w.end > w.start);
+});
+
 /* ── sizing ── */
 
 group('util.sealSize');

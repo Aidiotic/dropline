@@ -15,6 +15,10 @@ Covered:
 - Byte and duration formatting, including `NaN` and negative input.
 - Compression policy: that text is compressed, that already-packed formats are
   skipped, that SVG counts as text, and that tiny files skip it.
+- The measured compression decision: that a marginal ratio is refused because
+  both ends pay for it, that an expanding ratio is refused, that nonsense input
+  is refused rather than guessed at, and that the sample window skips the
+  container header without reading past the end of the file.
 - Chunk sizing against the transport limit, and seal sizing per device tier.
 - **Name and path sanitising**, in both directions. `../../etc/passwd` becomes
   `passwd`; `a/../../b` becomes `a/b`; depth is capped; colliding names are

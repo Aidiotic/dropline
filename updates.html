@@ -39,14 +39,6 @@
         </p>
       </li>
       <li>
-        <h3>Adaptive compression</h3>
-        <p>
-          Whether to compress is currently a guess from the file's type. Better
-          to compress the first chunk, measure the ratio it actually achieves,
-          and drop to raw for the rest when it is not paying for itself.
-        </p>
-      </li>
-      <li>
         <h3>Resume an interrupted transfer</h3>
         <p>
           A dropped connection recovers the session, but the file in flight
@@ -70,6 +62,31 @@
 
   <section class="panel">
     <h2 class="sect">Releases</h2>
+
+    <article class="rel">
+      <h3>v1.4 <time datetime="2026-08-23">23 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Compression is decided by measurement, not by the file's
+          name.</strong> The old rule guessed from the declared type, and it was
+          wrong in both directions: a <code>.bin</code> that was already an
+          archive got compressed for nothing, and a <code>.dat</code> full of
+          plain text was sent raw. A quarter-megabyte sample is now compressed
+          first and the real ratio decides, with anything that only shaves a few
+          percent left alone — that CPU is paid on both ends, and on a weak
+          device it is the difference between smooth and stuttering.
+        </li>
+        <li>
+          The sample is taken a quarter of the way in rather than from the
+          front, because containers put headers and metadata at the start and
+          those compress quite unlike the payload behind them.
+        </li>
+        <li>
+          A type already known to be packed still skips straight past without
+          paying for a measurement at all.
+        </li>
+      </ul>
+    </article>
 
     <article class="rel">
       <h3>v1.3 <time datetime="2026-08-23">23 Aug 2026</time></h3>

@@ -14,7 +14,7 @@ to pay for, and nothing to delete afterwards.
   screenshot, or send a link or password as a snippet.
 - **Streams to disk.** Nothing is held in memory, so file size is not bounded by
   RAM.
-- **Compresses in flight** when that helps, and skips it when it wouldn't.
+- **Compresses in flight** when a measurement says it will actually help.
 - **Reconnects** if the connection drops or a phone locks.
 - **Verifies both ends** hold the same link, and checksums every file.
 - **Adapts to the device** rather than assuming a fast desktop — five tiers,
@@ -58,9 +58,12 @@ receiver   striped channels → reorder → [gunzip] → disk, or sealed Blobs
   chunk ahead so disk and network overlap instead of taking turns.
 - **Chunk size is negotiated,** from `RTCPeerConnection.sctp.maxMessageSize`,
   and then capped by what the device can afford.
-- **Compressible files are gzipped in flight** via `CompressionStream`. Formats
-  that are already compressed skip it, because gzipping a JPEG costs CPU and
-  saves nothing.
+- **Compression is measured, not guessed.** A quarter-megabyte sample is
+  compressed first and the real ratio decides; anything that only shaves a few
+  percent is sent raw, because that CPU is paid on both ends. The sample comes
+  from a quarter of the way in, since container headers compress quite unlike
+  the payload behind them. Types already known to be packed skip the
+  measurement entirely.
 - **The receiver never holds a file in the heap.** With the File System Access
   API it writes straight to disk. Everywhere else, chunks are sealed into Blobs
   every few megabytes — Blob bytes live outside the JS heap and the browser

@@ -34,10 +34,30 @@ DL.util = (function () {
     return prefix + out;
   }
 
+  const GZIP_FLOOR = 8 * 1024;
+
+  // A cheap first filter. A type known to be packed already is never worth a
+  // measurement, and a tiny file is never worth a gzip header.
   function shouldCompress(mime, size, hasCompressionStream) {
     if (!hasCompressionStream) return false;
-    if (size <= 8 * 1024) return false; // header costs more than it saves
+    if (size <= GZIP_FLOOR) return false;
     return !PACKED.test(mime || '');
+  }
+
+  // Once a sample has actually been compressed, the ratio decides. Anything
+  // that only shaves a few percent is not worth the CPU on either end, and on
+  // a weak device that cost is the difference between smooth and stuttering.
+  function worthCompressing(ratio) {
+    if (typeof ratio !== 'number' || !isFinite(ratio) || ratio <= 0) return false;
+    return ratio < 0.9;
+  }
+
+  // Sample from a quarter in rather than the head: containers put headers and
+  // metadata at the front, which compress unlike the payload behind them.
+  function sampleWindow(size, sampleBytes) {
+    if (size <= sampleBytes) return { start: 0, end: size };
+    const start = Math.floor(size / 4);
+    return { start, end: Math.min(start + sampleBytes, size) };
   }
 
   // Blob sealing interval. Small devices seal more often so less sits in the
@@ -178,6 +198,7 @@ DL.util = (function () {
   return {
     PACKED, bytes, duration, newId, shouldCompress, sealSize,
     chunkSize, throttle, dedupeNames, safeName, safePath, eta, ema,
+    worthCompressing, sampleWindow, GZIP_FLOOR,
     crc32, crcInit, crcUpdate, crcFinal,
   };
 })();

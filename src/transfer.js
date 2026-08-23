@@ -62,6 +62,34 @@ DL.transfer = (function () {
     channel.addEventListener('bufferedamountlow', resolve, { once: true });
   });
 
+  const SAMPLE = 256 * 1024;
+
+  // Whether to compress used to be a guess from the file's declared type,
+  // which is wrong in both directions: a .bin that is already an archive got
+  // compressed for nothing, and a .dat of plain text did not get compressed at
+  // all. Compress a sample and measure instead. The cost is a few milliseconds
+  // on a quarter-megabyte, paid once per file.
+  async function shouldCompress(file, mime) {
+    if (!DL.util.shouldCompress(mime, file.size, HAS_GZIP)) return false;
+    try {
+      const { start, end } = DL.util.sampleWindow(file.size, SAMPLE);
+      const slice = file.slice(start, end);
+      const raw = end - start;
+      if (raw <= 0) return false;
+
+      let packed = 0;
+      const reader = slice.stream().pipeThrough(new CompressionStream('gzip')).getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        packed += value.byteLength;
+      }
+      return DL.util.worthCompressing(packed / raw);
+    } catch {
+      return false;   // if the measurement fails, send it plain
+    }
+  }
+
   /* ── sending ── */
 
   async function pumpFile(file, opts) {
@@ -196,5 +224,6 @@ DL.transfer = (function () {
   return {
     HAS_SAVE, HAS_DIR, HAS_GZIP,
     meter, sealingSink, toBytes, drain, pumpFile, chooseDestination, sinkFor,
+    shouldCompress,
   };
 })();

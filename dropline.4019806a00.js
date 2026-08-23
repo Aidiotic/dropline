@@ -38,10 +38,30 @@ DL.util = (function () {
     return prefix + out;
   }
 
+  const GZIP_FLOOR = 8 * 1024;
+
+  // A cheap first filter. A type known to be packed already is never worth a
+  // measurement, and a tiny file is never worth a gzip header.
   function shouldCompress(mime, size, hasCompressionStream) {
     if (!hasCompressionStream) return false;
-    if (size <= 8 * 1024) return false; // header costs more than it saves
+    if (size <= GZIP_FLOOR) return false;
     return !PACKED.test(mime || '');
+  }
+
+  // Once a sample has actually been compressed, the ratio decides. Anything
+  // that only shaves a few percent is not worth the CPU on either end, and on
+  // a weak device that cost is the difference between smooth and stuttering.
+  function worthCompressing(ratio) {
+    if (typeof ratio !== 'number' || !isFinite(ratio) || ratio <= 0) return false;
+    return ratio < 0.9;
+  }
+
+  // Sample from a quarter in rather than the head: containers put headers and
+  // metadata at the front, which compress unlike the payload behind them.
+  function sampleWindow(size, sampleBytes) {
+    if (size <= sampleBytes) return { start: 0, end: size };
+    const start = Math.floor(size / 4);
+    return { start, end: Math.min(start + sampleBytes, size) };
   }
 
   // Blob sealing interval. Small devices seal more often so less sits in the
@@ -182,6 +202,7 @@ DL.util = (function () {
   return {
     PACKED, bytes, duration, newId, shouldCompress, sealSize,
     chunkSize, throttle, dedupeNames, safeName, safePath, eta, ema,
+    worthCompressing, sampleWindow, GZIP_FLOOR,
     crc32, crcInit, crcUpdate, crcFinal,
   };
 })();
@@ -800,6 +821,34 @@ DL.transfer = (function () {
     channel.addEventListener('bufferedamountlow', resolve, { once: true });
   });
 
+  const SAMPLE = 256 * 1024;
+
+  // Whether to compress used to be a guess from the file's declared type,
+  // which is wrong in both directions: a .bin that is already an archive got
+  // compressed for nothing, and a .dat of plain text did not get compressed at
+  // all. Compress a sample and measure instead. The cost is a few milliseconds
+  // on a quarter-megabyte, paid once per file.
+  async function shouldCompress(file, mime) {
+    if (!DL.util.shouldCompress(mime, file.size, HAS_GZIP)) return false;
+    try {
+      const { start, end } = DL.util.sampleWindow(file.size, SAMPLE);
+      const slice = file.slice(start, end);
+      const raw = end - start;
+      if (raw <= 0) return false;
+
+      let packed = 0;
+      const reader = slice.stream().pipeThrough(new CompressionStream('gzip')).getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        packed += value.byteLength;
+      }
+      return DL.util.worthCompressing(packed / raw);
+    } catch {
+      return false;   // if the measurement fails, send it plain
+    }
+  }
+
   /* ── sending ── */
 
   async function pumpFile(file, opts) {
@@ -934,6 +983,7 @@ DL.transfer = (function () {
   return {
     HAS_SAVE, HAS_DIR, HAS_GZIP,
     meter, sealingSink, toBytes, drain, pumpFile, chooseDestination, sinkFor,
+    shouldCompress,
   };
 })();
 
@@ -1580,10 +1630,10 @@ DL.session = (function () {
 
     async function sendBatch(entries) {
       const batchId = `b${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-      const withGzip = entries.map((e) => ({
+      const withGzip = await Promise.all(entries.map(async (e) => ({
         ...e,
-        gzip: e.kind === 'file' && DL.util.shouldCompress(e.mime, e.size, DL.transfer.HAS_GZIP),
-      }));
+        gzip: e.kind === 'file' && await DL.transfer.shouldCompress(e.file, e.mime),
+      })));
       const { items, wire } = P.manifest(batchId, withGzip);
 
       items.forEach((it) => emit('item', { ...it, dir: 'out', state: 'offered', done: 0 }));

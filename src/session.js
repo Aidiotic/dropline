@@ -639,10 +639,10 @@ DL.session = (function () {
 
     async function sendBatch(entries) {
       const batchId = `b${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-      const withGzip = entries.map((e) => ({
+      const withGzip = await Promise.all(entries.map(async (e) => ({
         ...e,
-        gzip: e.kind === 'file' && DL.util.shouldCompress(e.mime, e.size, DL.transfer.HAS_GZIP),
-      }));
+        gzip: e.kind === 'file' && await DL.transfer.shouldCompress(e.file, e.mime),
+      })));
       const { items, wire } = P.manifest(batchId, withGzip);
 
       items.forEach((it) => emit('item', { ...it, dir: 'out', state: 'offered', done: 0 }));
