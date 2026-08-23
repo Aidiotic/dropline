@@ -203,9 +203,13 @@ DL.session = (function () {
     function adopt(c) {
       conn = c;
       let chain = Promise.resolve();
+      let handshakeDone = false;
+      shieldPeerJs(c);
 
       c.on('open', async () => {
-        note('open', { role: isHost ? 'host' : 'guest' });
+        note('open', { role: isHost ? 'host' : 'guest', repeat: handshakeDone });
+        if (handshakeDone) { flushOutbox(); return; }   // never redo the handshake
+        handshakeDone = true;
         retry = 0;
         helloSeen = false;
         authed = !secret;
@@ -246,6 +250,29 @@ DL.session = (function () {
       });
 
       c.on('error', () => { /* close follows; handled there */ });
+    }
+
+    // PeerJS's negotiator installs pc.ondatachannel and treats whatever
+    // arrives as *its* connection's channel, re-initialising the
+    // DataConnection and re-firing 'open'. Our stripe channels would each
+    // trigger that, which both restarts the handshake and hands PeerJS the
+    // wrong channel to send control messages on. Keep ours away from it;
+    // addEventListener listeners still fire, so collection is unaffected.
+    function shieldPeerJs(c) {
+      const pc = c.peerConnection;
+      if (!pc || pc.__droplineShielded) return;
+      pc.__droplineShielded = true;
+      let inner = pc.ondatachannel;
+      Object.defineProperty(pc, 'ondatachannel', {
+        configurable: true,
+        get() { return inner; },
+        set(fn) { inner = fn; },
+      });
+      pc.addEventListener('datachannel', (ev) => {
+        if (ev.channel && ev.channel.label && ev.channel.label.startsWith(DL.stripe.LABEL)) {
+          ev.stopImmediatePropagation();
+        }
+      }, true);   // capture phase, so this runs before PeerJS's own listener
     }
 
     // One side creates the channels and the other adopts them; both may then
