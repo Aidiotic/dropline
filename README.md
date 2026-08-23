@@ -1,55 +1,92 @@
 # dropline
 
-Send a file straight from your browser to someone else's. The bytes travel over a
-WebRTC data channel — they never land on a server, so there is nothing to host,
-nothing to pay for, and nothing to delete afterwards.
+Send a file straight from your browser to someone else's. The bytes travel over
+a WebRTC data channel — they never land on a server, so there is nothing to
+host, nothing to pay for, and nothing to delete afterwards.
+
+**Live at [aidiotic.github.io/dropline](https://aidiotic.github.io/dropline/)**
 
 ## How it works
 
-1. You pick a file. The page mints a random peer id and shows you a link.
-2. Your friend opens the link. Their browser connects directly to yours.
-3. The file streams across in 64 KB chunks, with a progress bar on both ends.
+1. You pick a file. The page mints a random peer id and shows a link and a QR code.
+2. Your friend opens the link, or scans the code with a phone.
+3. They accept, and the file streams across with a progress bar on both ends.
 
 A signalling server (PeerJS's free public broker) is used only to introduce the
-two browsers to each other. It sees the peer id and the connection handshake —
-never the file, never its name.
+two browsers. It sees the peer id and the connection handshake — never the file,
+never its name.
 
 ## The catch
 
 **Both tabs must be open at the same time.** There is no storage anywhere, so if
 you close your tab the link goes dead. This is a live handoff, not a dropbox.
 
-Other limits worth knowing:
+The other real limit: roughly 10–20% of network pairs — typically two symmetric
+NATs, or strict corporate firewalls — cannot form a direct connection. Fixing
+that requires a TURN relay, which is the one piece that genuinely costs money.
+Without one, those transfers fail to connect at all.
 
-- The receiver buffers the whole file in memory before saving, so very large
-  files (past a couple of GB) can exhaust the tab's memory.
-- Roughly 10–20% of network pairs — typically two symmetric NATs, or strict
-  corporate firewalls — cannot form a direct connection. Fixing that requires a
-  TURN relay server, which is the one piece that genuinely costs money. Without
-  one, those transfers just fail to connect.
-- One file per link. Zip a folder if you need to send several.
+One file per link. Zip a folder if you need to send several.
+
+## Why it's fast
+
+Nothing here is buffered whole. The file is a stream from end to end:
+
+```
+sender     File.stream() → [gzip] → re-chunk → data channel
+receiver   data channel → [gunzip] → FileSystemWritableFileStream → disk
+```
+
+Three things do the work:
+
+- **Chunk size is negotiated, not guessed.** The sender reads
+  `RTCPeerConnection.sctp.maxMessageSize` and sends the largest message the
+  transport will take — 256 KB on current browsers, against the 64 KB that is
+  usually hard-coded. Fewer, larger messages means less per-message overhead.
+- **Compressible files are gzipped in flight** via `CompressionStream`, and
+  decompressed on the fly at the other end. Text, CSV, logs and JSON often move
+  in a fraction of their real size. Formats that are already compressed —
+  images, video, audio, archives — skip this, because running them through gzip
+  costs CPU and saves nothing.
+- **The receiver writes straight to disk** through the File System Access API,
+  so memory stays flat no matter how large the file is. This is why receiving
+  takes an explicit click: `showSaveFilePicker()` requires a user gesture.
+
+Sending applies backpressure from `bufferedAmount`, so a fast disk can't outrun
+a slow network, and progress repaints are throttled to ~15/second — at
+100 MB/s a chunk lands every few milliseconds, and repainting on each one is
+itself enough to slow the transfer down.
+
+Firefox and Safari have no File System Access API, so they fall back to
+assembling a Blob in memory and offering a download link. That path still
+streams and still decompresses; it just holds the result in RAM, which caps
+practical file size a couple of GB below.
 
 ## Running it locally
 
-It is three static files with no build step, so any static server works:
+Three static files, no build step:
 
 ```bash
 npx serve .
 ```
 
-Then open the printed URL. WebRTC and the clipboard API both need a secure
-context, which means `localhost` or `https://` — opening `index.html` as a
-`file://` path will not work properly.
+WebRTC and the clipboard API both need a secure context, so use the `localhost`
+URL it prints — opening `index.html` as a `file://` path will not work.
 
 ## Deploying
 
-Any static host will serve it. For GitHub Pages, push to a repo and turn on
-Pages for the `main` branch root — there is no build step to configure.
+Any static host will serve it. It is on GitHub Pages from `main` at the repo
+root with no build step.
+
+One wrinkle worth knowing: Pages serves assets with `cache-control: max-age=600`,
+so `index.html` references `app.js?v=N` and `style.css?v=N`. **Bump `N` when you
+change either file**, or returning visitors will run up to ten minutes of stale
+code against fresh markup.
 
 ## Layout
 
 | File | What's in it |
 | --- | --- |
 | `index.html` | Markup for all four panels (pick / share / receive / error) |
-| `style.css` | Styling, light and dark |
-| `app.js` | Peer setup, chunked sending with backpressure, reassembly |
+| `style.css` | Flat cream-and-ink theme, light and dark |
+| `app.js` | Peer setup, the streaming pipelines, QR rendering |
