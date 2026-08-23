@@ -865,11 +865,12 @@ DL.session = (function () {
     function dial() {
       if (closed || !peer || peer.destroyed) return;
       emit('status', retry ? 'reconnecting' : 'connecting');
-      // serialization 'none' hands bytes straight to the data channel. The
-      // default 'binary' mode BinaryPacks every message and re-splits it into
-      // 16 KB pieces, which undoes the negotiated chunk size and costs a full
-      // encode/decode pass per chunk.
-      adopt(peer.connect(hostId, { reliable: true, serialization: 'none' }));
+      // 'raw' hands bytes straight to the data channel. The default 'binary'
+      // mode BinaryPacks every message and re-splits it into 16 KB pieces,
+      // which undoes the negotiated chunk size and costs a full encode/decode
+      // pass per chunk. The key really is 'raw' -- PeerJS registers no
+      // serializer under 'none', and asking for one throws at connect time.
+      adopt(peer.connect(hostId, { reliable: true, serialization: 'raw' }));
     }
 
     function scheduleRetry() {
