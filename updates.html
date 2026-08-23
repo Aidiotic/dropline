@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>dropline — update log</title>
+<meta name="description" content="Release notes and roadmap for dropline.">
+<link rel="stylesheet" href="style.css?v=8">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='3' fill='%23D97757'/></svg>">
+</head>
+<body class="doc">
+
+<main>
+  <header>
+    <div class="wordmark"><span class="mark" aria-hidden="true"></span>dropline</div>
+    <p class="lede">Update log and roadmap.</p>
+  </header>
+
+  <section class="panel">
+    <h2 class="sect">Roadmap</h2>
+    <p class="sect-note">
+      Ordered by how much each one actually hurts today. The first two are the
+      difference between a demo and something you'd rely on.
+    </p>
+
+    <ol class="road">
+      <li>
+        <h3>TURN relay <span class="tag tag-now">next</span></h3>
+        <p>
+          Roughly 10–20% of network pairs — two symmetric NATs, or a strict
+          corporate firewall — cannot form a direct connection at all, and today
+          those transfers simply fail. A TURN relay is the only real fix. This
+          is the single biggest gap.
+        </p>
+      </li>
+      <li>
+        <h3>Self-hosted signalling <span class="tag tag-now">next</span></h3>
+        <p>
+          Introductions currently go through PeerJS's free public broker: a
+          shared service with no uptime guarantee, and the most likely thing to
+          break without warning. Moving it to a Worker removes the one
+          third-party dependency in the path.
+        </p>
+      </li>
+      <li>
+        <h3>Multi-file and folders</h3>
+        <p>
+          One file per link today; a folder means zipping it first. A queue,
+          with drag-and-drop and paste-a-screenshot, covers what people
+          actually want to send.
+        </p>
+      </li>
+      <li>
+        <h3>Reconnect after sleep</h3>
+        <p>
+          If a phone locks or backgrounds the tab mid-transfer, the connection
+          dies and the whole file starts over. Rescanning the same code should
+          resume instead.
+        </p>
+      </li>
+      <li>
+        <h3>Send in both directions</h3>
+        <p>
+          The sender is whoever opened the page first. Either side should be
+          able to send, with the same interface on both.
+        </p>
+      </li>
+      <li>
+        <h3>Text and link snippets</h3>
+        <p>
+          Sending a URL, a wifi password or a snippet of code shouldn't require
+          making a file first.
+        </p>
+      </li>
+      <li>
+        <h3>Accessibility pass</h3>
+        <p>
+          Focus rings and keyboard access exist; live-region announcements and
+          progress bars that expose <code>aria-valuenow</code> do not.
+        </p>
+      </li>
+    </ol>
+  </section>
+
+  <section class="panel">
+    <h2 class="sect">Releases</h2>
+
+    <article class="rel">
+      <h3>v0.9 <time datetime="2026-08-23">23 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Replaced the download service worker with Blob sealing.</strong>
+          Chunks are sealed into Blobs every few megabytes; browsers spill those
+          to disk, so the heap stays flat without a worker. The finished file is
+          offered as an ordinary download link — a real click, which browsers
+          treat far more permissively than a synthetic download.
+        </li>
+        <li>
+          Seal interval adapts to <code>navigator.deviceMemory</code>: 2 MB on
+          low-memory devices, 8 MB on capable ones.
+        </li>
+        <li>Any previously registered service worker is now unregistered on load.</li>
+      </ul>
+      <p class="credit">
+        This approach is lifted from <em>Beam</em>, a LAN QR-transfer app, which
+        solved the same problem more robustly than the worker did.
+      </p>
+    </article>
+
+    <article class="rel">
+      <h3>v0.8 <time datetime="2026-08-22">22 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Stopped claiming files were saved when they weren't.</strong>
+          The receiver announced success as soon as it finished pushing bytes,
+          which is upstream of the browser actually writing the file. Chrome was
+          observed silently refusing a download while the interface said it had
+          been saved — the worst possible failure, since you'd never think to ask
+          for it again.
+        </li>
+      </ul>
+    </article>
+
+    <article class="rel">
+      <h3>v0.7 <time datetime="2026-08-22">22 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Added flow control between the two peers.</strong> A 64 MB
+          transfer was measured growing the receiver's heap by 118 MB, so the
+          earlier claim of flat memory was simply wrong. Backpressure existed
+          between the page and the worker, but nothing throttled the data
+          channel filling the queue, so the backlog moved upstream instead of
+          going away.
+        </li>
+        <li>
+          The receiver now queues by byte length against a 4 MB watermark and
+          sends hold/go over the data channel. Peak growth for the same transfer
+          fell to 55 MB, and doubling the file to 128 MB added only 22 MB more.
+        </li>
+      </ul>
+    </article>
+
+    <article class="rel">
+      <h3>v0.6 <time datetime="2026-08-22">22 Aug 2026</time></h3>
+      <ul>
+        <li>
+          Streamed downloads through a service worker so browsers without the
+          File System Access API stopped assembling whole files in memory.
+          Superseded by v0.9.
+        </li>
+      </ul>
+    </article>
+
+    <article class="rel">
+      <h3>v0.5 <time datetime="2026-08-22">22 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Fixed buttons that ignored the <code>hidden</code> attribute.</strong>
+          <code>.btn</code> sets <code>display: block</code>, which outranks the
+          browser's own <code>[hidden] { display: none }</code>. A Download
+          button was visible before anything had been received.
+        </li>
+        <li>
+          Asset URLs are versioned. GitHub Pages serves files with a ten-minute
+          cache, so returning visitors were running stale code against fresh
+          markup.
+        </li>
+      </ul>
+    </article>
+
+    <article class="rel">
+      <h3>v0.4 <time datetime="2026-08-22">22 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Opening a second link in an open tab did nothing.</strong> Only
+          the hash changes, which doesn't reload the page, so the receiver kept
+          showing the previous sender's file and a spent accept button.
+        </li>
+      </ul>
+    </article>
+
+    <article class="rel">
+      <h3>v0.3 <time datetime="2026-08-22">22 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Fixed out-of-order corruption.</strong> The receiver's message
+          handler was async, so when a chunk arrived as a Blob the pause let a
+          later chunk be written ahead of an earlier one. Messages now run
+          through a promise chain.
+        </li>
+      </ul>
+    </article>
+
+    <article class="rel">
+      <h3>v0.2 <time datetime="2026-08-22">22 Aug 2026</time></h3>
+      <ul>
+        <li>Rebuilt the interface: flat, cream and ink, one clay accent.</li>
+        <li>
+          The file is streamed rather than buffered, chunk size is negotiated
+          from the connection's <code>maxMessageSize</code> instead of hard-coded
+          at 64 KB, and compressible files are gzipped in flight. Already-packed
+          formats skip compression.
+        </li>
+        <li>QR code, so a phone can scan the link instead of typing it.</li>
+      </ul>
+    </article>
+
+    <article class="rel">
+      <h3>v0.1 <time datetime="2026-08-22">22 Aug 2026</time></h3>
+      <ul>
+        <li>
+          First version. Peer-to-peer file transfer over WebRTC, hosted as a
+          static page, with no server holding the file at any point.
+        </li>
+      </ul>
+    </article>
+  </section>
+
+  <footer>
+    <a href="./">← Back to dropline</a>
+    <a href="https://github.com/Aidiotic/dropline">Source</a>
+  </footer>
+</main>
+
+</body>
+</html>

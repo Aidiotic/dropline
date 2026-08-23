@@ -33,15 +33,12 @@ const PACKED = /^(image\/(?!svg)|video\/|audio\/)|^application\/(zip|gzip|x-7z|x
 
 const HAS_COMPRESSION = typeof CompressionStream === 'function';
 const HAS_FS_ACCESS = typeof window.showSaveFilePicker === 'function';
-const HAS_SW = 'serviceWorker' in navigator;
-
-// Registered eagerly so the streaming download path is ready by the time
-// someone accepts a transfer. Failure is fine — it just falls back to a Blob.
-let swReady = null;
-if (HAS_SW) {
-  swReady = navigator.serviceWorker.register('sw.js')
-    .then(() => navigator.serviceWorker.ready)
-    .catch(() => null);
+// v0.9 dropped the download service worker in favour of Blob sealing. Clear
+// any copy left registered on a returning visitor's machine.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations()
+    .then((regs) => regs.forEach((r) => r.unregister()))
+    .catch(() => {});
 }
 
 const RECV_WATERMARK = 4 * 1024 * 1024; // queued-but-unwritten bytes before we
@@ -308,71 +305,42 @@ const drain = (channel, low) => new Promise((resolve) => {
   channel.addEventListener('bufferedamountlow', resolve, { once: true });
 });
 
-/* ── streaming download through the service worker ────────────── */
+/* ── sealing sink: flat memory without a service worker ───────── */
 
-// Builds a WritableStream that pipes into a browser download, so browsers
-// without showSaveFilePicker still write to disk instead of filling memory.
-// Returns null if the worker isn't available, so the caller can fall back.
-async function openDownloadStream(meta) {
-  if (!swReady) return null;
+// Chunks are sealed into Blobs at intervals. Blob bytes live outside the JS
+// heap and browsers spill them to disk, so the heap stays flat however large
+// the file is. The finished Blob is offered as a normal download link, which
+// the user clicks -- a trusted gesture, and far less likely to be refused than
+// a synthetic one.
+function sealSize() {
+  const gb = navigator.deviceMemory || 4;
+  if (gb <= 2) return 2 * 1024 * 1024;
+  if (gb <= 4) return 4 * 1024 * 1024;
+  return 8 * 1024 * 1024;
+}
 
-  const reg = await swReady;
-  if (!reg || !reg.active) return null;
+function sealingSink(meta, onFinished) {
+  const sealed = [];      // disk-backed Blobs
+  const limit = sealSize();
+  let pending = [];
+  let bytesPending = 0;
 
-  const id = crypto.randomUUID();
-  const channel = new MessageChannel();
-  const port = channel.port1;
-
-  let credits = 0;
-  let waiting = null;
-  let cancelled = false;
-  let ready = null;
-
-  port.onmessage = (e) => {
-    const type = e.data && e.data.type;
-    if (type === 'ready') { ready && ready(); return; }
-    if (type === 'cancel') cancelled = true;   // user cancelled the download
-    else if (type === 'pull') credits++;
-    if (waiting) { const w = waiting; waiting = null; w(); }
-  };
-
-  const handshake = new Promise((resolve) => { ready = resolve; });
-  reg.active.postMessage(
-    { type: 'register', id, name: meta.name, size: meta.size },
-    [channel.port2],
-  );
-
-  const timeout = new Promise((resolve) => setTimeout(() => resolve('timeout'), 5000));
-  if (await Promise.race([handshake.then(() => 'ok'), timeout]) !== 'ok') return null;
-
-  // Kick off the download; the worker answers it with the stream below.
-  const frame = document.createElement('iframe');
-  frame.hidden = true;
-  frame.src = new URL(`__dl__/${id}`, reg.scope).href;
-  document.body.append(frame);
-
-  const credit = async () => {
-    while (!cancelled && credits <= 0) {
-      await new Promise((resolve) => { waiting = resolve; });
-    }
-    if (cancelled) throw new Error('download cancelled');
-    credits--;
+  const seal = () => {
+    if (!pending.length) return;
+    sealed.push(new Blob(pending));
+    pending = [];
+    bytesPending = 0;
   };
 
   return new WritableStream({
-    async write(chunk) {
-      await credit();
-      // Transfer the buffer rather than copying it across the worker boundary.
-      const buf = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
-      port.postMessage({ type: 'chunk', chunk: buf }, [buf]);
+    write(chunk) {
+      pending.push(chunk);
+      bytesPending += chunk.byteLength;
+      if (bytesPending >= limit) seal();
     },
     close() {
-      port.postMessage({ type: 'end' });
-      setTimeout(() => frame.remove(), 2000);
-    },
-    abort() {
-      port.postMessage({ type: 'abort' });
-      frame.remove();
+      seal();
+      onFinished(new Blob(sealed, { type: meta.mime || 'application/octet-stream' }));
     },
   });
 }
@@ -498,57 +466,51 @@ async function receiveInto(conn, meta, handle, exposeSink, flow) {
     }
   }));
 
-  // Three ways to land the bytes, best first. Only the last one holds the
-  // whole file in memory, and it is reached only if the other two are absent.
+  // Straight to disk where the browser allows it; otherwise seal into Blobs,
+  // which the browser also spills to disk. Neither holds the file in the heap.
   let destination = null;
-  let how = 'memory';
+  let onDisk = false;
+  let assembled = null;
 
   if (handle) {
     try {
       destination = await handle.createWritable();
-      how = 'disk';
+      onDisk = true;
     } catch {
-      destination = null; // lost write permission — try the next option
+      destination = null; // lost write permission — fall through to sealing
     }
   }
 
-  if (!destination) {
-    destination = await openDownloadStream(meta).catch(() => null);
-    how = destination ? 'download' : 'memory';
-  }
+  if (!destination) destination = sealingSink(meta, (blob) => { assembled = blob; });
 
   // Set up before asking for bytes, and start the clock here so the save
-  // dialog and worker handshake don't count against the measured rate.
+  // dialog doesn't count against the measured rate.
   t0 = performance.now();
   conn.send(JSON.stringify({ kind: 'ready' }));
 
   try {
-    if (destination) {
-      await stream.pipeTo(destination);
-    } else {
-      const blob = await new Response(stream).blob();
-      objectUrl = URL.createObjectURL(blob);
-      els.saveLink.href = objectUrl;
-      els.saveLink.download = meta.name;
-      els.saveLink.hidden = false;
-    }
+    await stream.pipeTo(destination);
   } catch {
     fail('The transfer did not finish — the sender may have closed their tab.');
     return;
+  }
+
+  if (assembled) {
+    objectUrl = URL.createObjectURL(assembled);
+    els.saveLink.href = objectUrl;
+    els.saveLink.download = meta.name;
+    els.saveLink.hidden = false;
   }
 
   const secs = (performance.now() - t0) / 1000;
   const rate = `${bytes(meta.size / secs)}/s`;
   els.recvFill.style.width = '100%';
   els.recvFill.classList.add('done');
-  els.recvStatus.textContent = {
-    // Only the FSA path writes the file itself, so only it can claim "saved".
-    // The worker path hands the bytes to the browser, which owns the write and
-    // may still refuse it — don't report a certainty we don't have.
-    disk: `Saved ${bytes(meta.size)} to disk · ${rate}`,
-    download: `${bytes(meta.size)} sent to your browser's downloads · ${rate}`,
-    memory: `${bytes(meta.size)} received · ${rate}`,
-  }[how];
+  // Only the File System Access path writes the file itself, so only it gets
+  // to say "saved". Otherwise the file is ready and waiting on a click.
+  els.recvStatus.textContent = onDisk
+    ? `Saved ${bytes(meta.size)} to disk · ${rate}`
+    : `${bytes(meta.size)} received · ${rate}`;
 }
 
 /* ── wiring ───────────────────────────────────────────────────── */

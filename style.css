@@ -268,6 +268,98 @@ footer {
 footer a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--rule); }
 footer a:hover { color: var(--ink); border-color: var(--ink); }
 
+.foot-links { display: flex; gap: 16px; }
+
+/* ── update log ── */
+
+body.doc { place-items: start center; padding-block: clamp(40px, 9vh, 88px); }
+body.doc main { max-width: 620px; }
+
+.sect {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 620;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.sect-note { margin: 0 0 28px; color: var(--muted); font-size: 14px; max-width: 52ch; }
+
+.road { margin: 0; padding: 0; list-style: none; counter-reset: road; }
+
+.road li {
+  position: relative;
+  padding: 20px 0 20px 38px;
+  border-top: 1px solid var(--rule);
+  counter-increment: road;
+}
+
+.road li::before {
+  content: counter(road);
+  position: absolute;
+  left: 0;
+  top: 21px;
+  font-size: 12px;
+  font-weight: 620;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.road h3, .rel h3 {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 5px;
+  font-size: 16px;
+  font-weight: 620;
+  letter-spacing: -0.02em;
+}
+
+.road p { margin: 0; color: var(--muted); font-size: 14px; text-wrap: pretty; }
+
+.tag {
+  padding: 2px 7px;
+  border-radius: 3px;
+  font-size: 10.5px;
+  font-weight: 620;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.tag-now { background: var(--clay); color: #fff; }
+
+.rel { padding: 22px 0; border-top: 1px solid var(--rule); }
+
+.rel h3 time {
+  margin-left: auto;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.rel ul { margin: 0; padding-left: 18px; }
+.rel li { margin-bottom: 9px; color: var(--muted); font-size: 14px; text-wrap: pretty; }
+.rel li:last-child { margin-bottom: 0; }
+.rel strong { color: var(--ink); font-weight: 620; }
+
+.credit {
+  margin: 12px 0 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--rule);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--raised);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.9em;
+}
+
 #error-msg { color: var(--bad); }
 
 @media (max-width: 420px) {
