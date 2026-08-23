@@ -953,6 +953,14 @@ DL.session = (function () {
     return out;
   }
 
+  // A small ring of recent protocol events. Costs nothing, and turns "it
+  // didn't connect" into something answerable without a redeploy.
+  const trace = [];
+  function note(event, detail) {
+    trace.push({ t: Date.now(), event, ...detail });
+    if (trace.length > 120) trace.shift();
+  }
+
   function create(options) {
     const on = options.on || {};
     const isHost = options.role === 'host';
@@ -1046,6 +1054,7 @@ DL.session = (function () {
     }
 
     function dial() {
+      note('dial', { retry });
       if (closed || !peer || peer.destroyed) return;
       emit('status', retry ? 'reconnecting' : 'connecting');
       // 'raw' hands bytes straight to the data channel. The default 'binary'
@@ -1073,6 +1082,7 @@ DL.session = (function () {
       let chain = Promise.resolve();
 
       c.on('open', async () => {
+        note('open', { role: isHost ? 'host' : 'guest' });
         retry = 0;
         helloSeen = false;
         authed = !secret;
@@ -1103,6 +1113,7 @@ DL.session = (function () {
       });
 
       c.on('close', () => {
+        note('close');
         if (closed) return;
         failActiveTransfers('The connection dropped.');
         conn = null;
@@ -1196,7 +1207,8 @@ DL.session = (function () {
       }
 
       const msg = P.parse(raw);
-      if (!msg) return;
+      if (!msg) { note('rx-unparsed'); return; }
+      note('rx', { type: msg.t });
 
       switch (msg.t) {
         case P.T.HELLO:
@@ -1218,9 +1230,11 @@ DL.session = (function () {
           const want = await digest(`${secret}:${myNonce}`);
           myNonce = null;
           if (msg.value === want) {
+            note('auth-ok');
             authed = true;
             emit('authenticated', true);
           } else {
+            note('auth-mismatch', { got: String(msg.value).slice(0, 8), want: want.slice(0, 8) });
             emit('error', 'The other device could not prove it holds this link.');
             close();
           }
@@ -1414,8 +1428,10 @@ DL.session = (function () {
     const outbox = [];
 
     function send(raw) {
-      if (live()) { conn.send(raw); return; }
-      if (!closed) outbox.push(raw);
+      let type = '?';
+      try { type = JSON.parse(raw).t; } catch { /* not control */ }
+      if (live()) { note('tx', { type }); conn.send(raw); return; }
+      if (!closed) { note('queued', { type }); outbox.push(raw); }
     }
 
     function flushOutbox() {
@@ -1558,6 +1574,7 @@ DL.session = (function () {
       get hostId() { return hostId; },
       get secret() { return secret; },
       get authenticated() { return authed; },
+      get trace() { return trace.slice(); },
       describeLink,
       get connected() { return live() && helloSeen; },
     };
