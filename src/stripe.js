@@ -74,9 +74,22 @@ DL.stripe = (function () {
     const high = opts.high;
     let index = 0;
 
+    // bufferedamountlow never fires on a channel that has closed, so waiting
+    // only for it deadlocks the sender the moment a connection drops -- and a
+    // send that never returns can never fail, so nothing ever resumes.
     const drain = (ch) => new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        ch.removeEventListener('bufferedamountlow', done);
+        ch.removeEventListener('close', done);
+        ch.removeEventListener('error', done);
+        resolve();
+      };
+      const timer = setTimeout(done, 5000);
       ch.bufferedAmountLowThreshold = high >> 1;
-      ch.addEventListener('bufferedamountlow', resolve, { once: true });
+      ch.addEventListener('bufferedamountlow', done);
+      ch.addEventListener('close', done);
+      ch.addEventListener('error', done);
     });
 
     return {
@@ -95,9 +108,11 @@ DL.stripe = (function () {
         index++;
       },
       async flush() {
-        // Every channel must be empty before the finish message goes out.
+        // Every channel must be empty before the finish message goes out, but
+        // a dead channel never drains -- bound the wait.
+        const deadline = Date.now() + 20000;
         for (const ch of channels) {
-          while (ch.readyState === 'open' && ch.bufferedAmount > 0) {
+          while (ch.readyState === 'open' && ch.bufferedAmount > 0 && Date.now() < deadline) {
             await new Promise((r) => setTimeout(r, 15));
           }
         }

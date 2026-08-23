@@ -68,10 +68,21 @@ DL.transfer = (function () {
     return null;
   }
 
-  // Let our own send queue drain before pushing more at the transport.
+  // Let our own send queue drain before pushing more at the transport. A closed
+  // channel never fires bufferedamountlow, so this must not wait on that alone.
   const drain = (channel, low) => new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      channel.removeEventListener('bufferedamountlow', done);
+      channel.removeEventListener('close', done);
+      channel.removeEventListener('error', done);
+      resolve();
+    };
+    const timer = setTimeout(done, 5000);
     channel.bufferedAmountLowThreshold = low;
-    channel.addEventListener('bufferedamountlow', resolve, { once: true });
+    channel.addEventListener('bufferedamountlow', done);
+    channel.addEventListener('close', done);
+    channel.addEventListener('error', done);
   });
 
   const SAMPLE = 256 * 1024;
