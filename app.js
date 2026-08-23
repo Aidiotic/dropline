@@ -33,6 +33,16 @@ const PACKED = /^(image\/(?!svg)|video\/|audio\/)|^application\/(zip|gzip|x-7z|x
 
 const HAS_COMPRESSION = typeof CompressionStream === 'function';
 const HAS_FS_ACCESS = typeof window.showSaveFilePicker === 'function';
+const HAS_SW = 'serviceWorker' in navigator;
+
+// Registered eagerly so the streaming download path is ready by the time
+// someone accepts a transfer. Failure is fine — it just falls back to a Blob.
+let swReady = null;
+if (HAS_SW) {
+  swReady = navigator.serviceWorker.register('sw.js')
+    .then(() => navigator.serviceWorker.ready)
+    .catch(() => null);
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -274,6 +284,75 @@ const drain = (channel, low) => new Promise((resolve) => {
   channel.addEventListener('bufferedamountlow', resolve, { once: true });
 });
 
+/* ── streaming download through the service worker ────────────── */
+
+// Builds a WritableStream that pipes into a browser download, so browsers
+// without showSaveFilePicker still write to disk instead of filling memory.
+// Returns null if the worker isn't available, so the caller can fall back.
+async function openDownloadStream(meta) {
+  if (!swReady) return null;
+
+  const reg = await swReady;
+  if (!reg || !reg.active) return null;
+
+  const id = crypto.randomUUID();
+  const channel = new MessageChannel();
+  const port = channel.port1;
+
+  let credits = 0;
+  let waiting = null;
+  let cancelled = false;
+  let ready = null;
+
+  port.onmessage = (e) => {
+    const type = e.data && e.data.type;
+    if (type === 'ready') { ready && ready(); return; }
+    if (type === 'cancel') cancelled = true;   // user cancelled the download
+    else if (type === 'pull') credits++;
+    if (waiting) { const w = waiting; waiting = null; w(); }
+  };
+
+  const handshake = new Promise((resolve) => { ready = resolve; });
+  reg.active.postMessage(
+    { type: 'register', id, name: meta.name, size: meta.size },
+    [channel.port2],
+  );
+
+  const timeout = new Promise((resolve) => setTimeout(() => resolve('timeout'), 5000));
+  if (await Promise.race([handshake.then(() => 'ok'), timeout]) !== 'ok') return null;
+
+  // Kick off the download; the worker answers it with the stream below.
+  const frame = document.createElement('iframe');
+  frame.hidden = true;
+  frame.src = new URL(`__dl__/${id}`, reg.scope).href;
+  document.body.append(frame);
+
+  const credit = async () => {
+    while (!cancelled && credits <= 0) {
+      await new Promise((resolve) => { waiting = resolve; });
+    }
+    if (cancelled) throw new Error('download cancelled');
+    credits--;
+  };
+
+  return new WritableStream({
+    async write(chunk) {
+      await credit();
+      // Transfer the buffer rather than copying it across the worker boundary.
+      const buf = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+      port.postMessage({ type: 'chunk', chunk: buf }, [buf]);
+    },
+    close() {
+      port.postMessage({ type: 'end' });
+      setTimeout(() => frame.remove(), 2000);
+    },
+    abort() {
+      port.postMessage({ type: 'abort' });
+      frame.remove();
+    },
+  });
+}
+
 /* ── receiving ────────────────────────────────────────────────── */
 
 function resetReceive() {
@@ -358,7 +437,7 @@ function startReceiving(hostId) {
 }
 
 async function receiveInto(conn, meta, handle, exposeSink) {
-  const t0 = performance.now();
+  let t0 = performance.now();
   let got = 0;
 
   const incoming = new ReadableStream({ start: exposeSink });
@@ -374,11 +453,33 @@ async function receiveInto(conn, meta, handle, exposeSink) {
   if (meta.gzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
   stream = stream.pipeThrough(meter((n) => { got += n; tick(); }));
 
+  // Three ways to land the bytes, best first. Only the last one holds the
+  // whole file in memory, and it is reached only if the other two are absent.
+  let destination = null;
+  let how = 'memory';
+
+  if (handle) {
+    try {
+      destination = await handle.createWritable();
+      how = 'disk';
+    } catch {
+      destination = null; // lost write permission — try the next option
+    }
+  }
+
+  if (!destination) {
+    destination = await openDownloadStream(meta).catch(() => null);
+    how = destination ? 'download' : 'memory';
+  }
+
+  // Set up before asking for bytes, and start the clock here so the save
+  // dialog and worker handshake don't count against the measured rate.
+  t0 = performance.now();
   conn.send(JSON.stringify({ kind: 'ready' }));
 
   try {
-    if (handle) {
-      await stream.pipeTo(await handle.createWritable());
+    if (destination) {
+      await stream.pipeTo(destination);
     } else {
       const blob = await new Response(stream).blob();
       objectUrl = URL.createObjectURL(blob);
@@ -392,11 +493,14 @@ async function receiveInto(conn, meta, handle, exposeSink) {
   }
 
   const secs = (performance.now() - t0) / 1000;
+  const rate = `${bytes(meta.size / secs)}/s`;
   els.recvFill.style.width = '100%';
   els.recvFill.classList.add('done');
-  els.recvStatus.textContent = handle
-    ? `Saved ${bytes(meta.size)} to disk · ${bytes(meta.size / secs)}/s`
-    : `${bytes(meta.size)} received · ${bytes(meta.size / secs)}/s`;
+  els.recvStatus.textContent = {
+    disk: `Saved ${bytes(meta.size)} to disk · ${rate}`,
+    download: `Saved ${bytes(meta.size)} to your downloads · ${rate}`,
+    memory: `${bytes(meta.size)} received · ${rate}`,
+  }[how];
 }
 
 /* ── wiring ───────────────────────────────────────────────────── */
