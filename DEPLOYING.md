@@ -8,6 +8,13 @@ things below are optional, but the first is what separates "works for me" from
 
 ## 1. TURN relay — fixes the transfers that fail entirely
 
+> **Current state:** the worker is deployed at
+> `https://dropline-turn.dropline.workers.dev` with both secrets set, but it
+> answers `404` from the TURN provider because **no TURN key has been created in
+> the Cloudflare dashboard** — the stored secrets are placeholder text. The
+> endpoint reports this in its own response body. Until a real key exists, the
+> app falls back to STUN and roughly 10–20% of pairs cannot connect.
+
 **Why you want this.** Two peers behind symmetric NATs, or on a network that
 blocks peer-to-peer UDP, cannot reach each other directly no matter what. STUN
 does not help; only a relay does. That is roughly 10–20% of real-world pairs,
@@ -33,18 +40,20 @@ stand that endpoint up.
    The secrets stay in Cloudflare. They are never committed, and never reach a
    browser — only the derived credential does, and it expires in an hour.
 
-3. **Edit `ALLOWED_ORIGINS`** in `worker/turn-credentials.js` if you serve the
+3. **Point `config.js` at it** once the key exists, by uncommenting
+   `turnCredentialsUrl`. The client already reads it and falls back silently
+   when it is absent or failing, so nothing breaks in the meantime.
+
+4. **Edit `ALLOWED_ORIGINS`** in `worker/turn-credentials.js` if you serve the
    site from anywhere other than `aidiotic.github.io`. This keeps other sites
    off your relay quota.
 
-4. **Point the client at it.** In `config.js`:
+   `config.js` is deliberately not bundled or hashed, so you can edit it on a
+   deployed site without rebuilding:
 
    ```js
-   turnCredentialsUrl: 'https://dropline-turn.<your-subdomain>.workers.dev/',
+   turnCredentialsUrl: 'https://dropline-turn.dropline.workers.dev/',
    ```
-
-   `config.js` is deliberately not bundled or hashed, so you can edit it on a
-   deployed site without rebuilding.
 
 5. **Verify.** Load the site and check the network tab for a request to the
    worker returning `iceServers`. If it fails, dropline logs a warning and

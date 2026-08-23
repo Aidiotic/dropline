@@ -5,21 +5,30 @@ supports.
 
 ## Automated: `npm test`
 
-42 unit tests over the pure logic in `src/util.js` and `src/protocol.js` — the
-parts where a bug is silent rather than loud. They run in CI on every push.
+65 unit tests over the pure logic in `src/util.js`, `src/device.js` and
+`src/protocol.js` — the parts where a bug is silent rather than loud. They run
+in CI on every push, alongside `npm run check`, which fails if the committed
+bundle no longer matches `src/`.
 
 Covered:
 
 - Byte and duration formatting, including `NaN` and negative input.
 - Compression policy: that text is compressed, that already-packed formats are
   skipped, that SVG counts as text, and that tiny files skip it.
-- Chunk sizing against the transport limit, and seal sizing by device memory.
+- Chunk sizing against the transport limit, and seal sizing per device tier.
 - **Name and path sanitising**, in both directions. `../../etc/passwd` becomes
   `passwd`; `a/../../b` becomes `a/b`; depth is capped; colliding names are
   disambiguated instead of overwriting.
 - **Malformed and hostile messages**: bad JSON, missing fields, wrong types, an
   empty manifest, a 501-item manifest, negative sizes. These must return `null`
   rather than throw inside an event handler.
+- **CRC32** against the canonical `123456789` → `0xCBF43926` check vector, plus
+  the cases it exists to catch: a reordered chunk and a truncated stream must
+  both produce a different value, and incremental updates must equal one pass.
+- **Device tiering**: that save-data alone drops a tier, that a draining battery
+  penalises rather than overrides, that charging removes the penalty, that
+  unknown hardware lands mid-range rather than assuming the worst, and that
+  budgets never invert between tiers.
 
 Not covered here: anything needing a real peer connection, a real stream, or a
 DOM. `src/session.js`, `src/transfer.js` and `src/ui.js` have no unit tests —
@@ -42,6 +51,30 @@ digests on both ends:
 | Reconnect | Guest reloaded; host re-paired and a later transfer matched |
 | Memory | 96 MB file received with a median heap of 15 MB |
 | Backpressure | 64 MB grew the heap 118 MB before flow control, 55 MB after |
+| Corruption caught | One byte flipped in flight → failed with a checksum mismatch, no download offered |
+| Authentication | Both ends showed the same code and reported verified |
+| Striped transfer | 64 MB over 4 channels, SHA-256 matched and CRC verified |
+
+## Performance measurements
+
+All over loopback between two tabs, which isolates CPU cost rather than network:
+
+| Configuration | Throughput |
+| --- | --- |
+| v1.1 baseline, single channel, BinaryPack | 8.7 MB/s |
+| After raw serialization + zero-copy send | 10.5 MB/s |
+| A *raw* data channel with no application logic | 10.5 MB/s |
+| 2 striped channels | 14.1 MB/s |
+| 4 striped channels (current default) | 15.0 MB/s |
+| 8 striped channels | 16.0 MB/s |
+
+The third row is the important one: once the engine matched a bare data channel,
+everything above the transport had been paid for, and the remaining limit was
+SCTP itself. That is what justified striping rather than further micro-tuning.
+
+Loopback numbers are not representative of a real link — both peers are on one
+machine — and should be read as a ceiling on our own overhead, not as a
+transfer speed anyone will see.
 
 ## What is *not* verified
 

@@ -16,6 +16,8 @@ to pay for, and nothing to delete afterwards.
   RAM.
 - **Compresses in flight** when that helps, and skips it when it wouldn't.
 - **Reconnects** if the connection drops or a phone locks.
+- **Verifies both ends** hold the same link, and checksums every file.
+- **Adapts to the device** rather than assuming a fast desktop.
 
 A signalling server is used only to introduce the two browsers. It sees the
 session id and the connection handshake — never the files, never their names.
@@ -36,27 +38,52 @@ stopped.
 ## How it moves bytes
 
 ```
-sender     File.stream() → [gzip] → chunk → data channel
-receiver   data channel → [gunzip] → disk, or sealed Blobs → download
+sender     file.slice() → [gzip] → 4 striped data channels
+receiver   striped channels → reorder → [gunzip] → disk, or sealed Blobs
 ```
 
+- **The payload is striped across parallel data channels.** A single channel
+  measured 10.5 MB/s over loopback — and so did a raw channel carrying no
+  application logic at all, which is how we know the limit was SCTP rather than
+  anything above it. Four channels measured 15.0 MB/s. Ordering needs no
+  per-chunk header: chunk *i* is sent on channel *i mod N*, and since each
+  channel is ordered on its own, the *k*-th arrival on channel *c* is globally
+  chunk *k·N + c*. That keeps the send path copy-free.
+- **PeerJS runs in `raw` mode.** Its default `binary` serialization packs every
+  message and re-splits it into 16 KB pieces, undoing the negotiated chunk size
+  and costing an encode and decode pass per chunk.
+- **Nothing is copied on the way out.** Slicing the file directly yields buffers
+  that are already exactly one chunk and already owned by us, and reads run one
+  chunk ahead so disk and network overlap instead of taking turns.
 - **Chunk size is negotiated,** from `RTCPeerConnection.sctp.maxMessageSize`,
-  rather than hard-coded — 256 KB on current browsers against the 64 KB that is
-  usually assumed.
+  and then capped by what the device can afford.
 - **Compressible files are gzipped in flight** via `CompressionStream`. Formats
   that are already compressed skip it, because gzipping a JPEG costs CPU and
   saves nothing.
 - **The receiver never holds a file in the heap.** With the File System Access
   API it writes straight to disk. Everywhere else, chunks are sealed into Blobs
   every few megabytes — Blob bytes live outside the JS heap and the browser
-  spills them to disk. The seal interval follows `navigator.deviceMemory`.
+  spills them to disk. The seal interval comes from the device tier.
 
 **Two layers of backpressure, and both are needed.** `bufferedAmount` stops a
 fast disk outrunning a slow network, but it only describes the *sender's* own
 queue — it cannot see a receiver that writes slower than the channel delivers.
-So the receiver also queues by byte length against a 4 MB watermark and sends
+So the receiver also queues by byte length against a tier-sized watermark and sends
 `hold`/`go` back over the channel. Without that second layer, a 64 MB transfer
 grew the receiver's heap by 118 MB.
+
+## The device profile
+
+`src/device.js` is the only place that decides what the machine is. It scores
+the real capability signals — memory, cores, network type, data-saver, battery,
+pointer, viewport — into a tier, a form factor, a density and a motion level,
+and publishes them on `<html>` so CSS responds without JavaScript touching
+styles. Chunk cap, seal interval, receive watermark, repaint rate, thumbnails
+and animation all follow from it, and it is recomputed on resize, rotation,
+network change and battery change.
+
+The point is that a cheap phone on a dying battery over 3G does *less work*,
+rather than the same work more slowly.
 
 ## Safety
 
@@ -66,8 +93,19 @@ names, `..` segments are dropped from paths, depth is capped, and colliding
 names are disambiguated rather than silently overwriting each other. A peer
 cannot write outside the folder you picked.
 
-The link is the secret — anyone holding it can join the session, and only one
-peer may be connected at a time.
+**The link carries a secret**, after the `~`. URL fragments are never sent to a
+server, so the signalling broker learns the session id and nothing else — it
+cannot impersonate either side. Both peers prove they hold the secret via a
+nonce challenge before any transfer is accepted, and a four-character code
+derived from it is shown on both devices to compare by eye. A link without a
+secret still works, and says plainly that it is unverified.
+
+**Every file is checksummed** with a rolling CRC32 as it streams — before
+compression outbound, after decompression inbound — and compared on arrival.
+A mismatch fails the transfer visibly and refuses to offer the file. It is a
+corruption check, not a tamper check, and is not relied on for security.
+
+Only one peer may be connected at a time.
 
 ## Development
 
@@ -94,13 +132,23 @@ WebRTC and the clipboard API need a secure context, so use the `localhost` URL
 
 | Path | What's in it |
 | --- | --- |
-| `src/util.js` | Pure helpers: formatting, sizing, name and path sanitising |
+| `src/util.js` | Pure helpers: formatting, sizing, CRC32, name and path sanitising |
+| `src/device.js` | Capability scoring; the performance budget and layout shape |
+| `src/stripe.js` | Parallel data channels and header-free reordering |
 | `src/protocol.js` | Wire messages, manifest building, untrusted-input parsing |
 | `src/transfer.js` | Stream plumbing: chunked send, sealing, destinations |
 | `src/session.js` | Peer lifecycle, reconnection, routing, send/receive machines |
 | `src/ui.js` | The only file that touches the DOM |
 | `config.js` | Runtime config — not bundled, editable on a live deploy |
 | `worker/` | Cloudflare Worker that mints short-lived TURN credentials |
+| `sw.js` | Offline shell; cache-first only for fingerprinted assets |
 | `build.js` / `test.js` | Bundler and test runner, no dependencies |
+
+## Debugging
+
+`DL.session.active.trace` holds a ring of recent protocol events — every control
+message sent, queued and received, plus connection and authentication
+transitions. It costs nothing and turns "it didn't connect" into something
+answerable without a redeploy.
 
 See [TESTING.md](TESTING.md) for what is verified and what isn't.

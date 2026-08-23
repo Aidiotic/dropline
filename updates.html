@@ -20,54 +20,66 @@
   <section class="panel">
     <h2 class="sect">Roadmap</h2>
     <p class="sect-note">
-      Ordered by how much each one actually hurts today. The top two are the
-      only things still standing between this and something you'd depend on —
-      and both are written and waiting on a deploy rather than on code.
+      Ordered by how much each one actually hurts today. The first is the only
+      thing left that makes transfers fail outright, and it is waiting on an
+      account credential rather than on code.
     </p>
 
     <ol class="road">
       <li>
-        <h3>TURN relay <span class="tag tag-now">ready to deploy</span></h3>
+        <h3>TURN relay <span class="tag tag-now">blocked</span></h3>
         <p>
-          Roughly 10–20% of network pairs — two symmetric NATs, or a strict
-          corporate firewall — cannot form a direct connection, and those
-          transfers fail outright. The relay worker is deployed and the client
-          is wired to it, but it is not yet issuing credentials: it needs a TURN
-          key created in the Cloudflare dashboard. Until that exists this remains
-          the single biggest gap, and the app quietly falls back to STUN.
+          Still the biggest gap: roughly 10–20% of network pairs cannot form a
+          direct connection and those transfers fail outright. The worker is
+          deployed at <code>dropline-turn.dropline.workers.dev</code> and the
+          client is wired to read short-lived credentials from it, but no TURN
+          key has been created in the Cloudflare dashboard, so it answers 404
+          and the app falls back to STUN. Creating that key means handling an
+          API token, which is the account owner's to do.
         </p>
       </li>
       <li>
-        <h3>Self-hosted signalling <span class="tag tag-now">ready to deploy</span></h3>
+        <h3>Settings panel</h3>
         <p>
-          Introductions still go through PeerJS's free public broker: a shared
-          service with no uptime guarantee, and the likeliest thing to break
-          without warning. Point <code>config.js</code> at your own PeerServer to
-          remove the last third-party dependency in the path.
+          Theme, motion, auto-accept and stripe count are decided for you or
+          buried. One compact panel should hold them, with the choices
+          remembered.
+        </p>
+      </li>
+      <li>
+        <h3>Finer performance tiers</h3>
+        <p>
+          Three tiers is coarse. A 2 GB machine and a 32-core workstation both
+          deserve their own settings, and <code>navigator.deviceMemory</code>
+          alone cannot tell them apart — a short runtime capability probe would
+          measure what the machine actually does rather than what it claims.
+        </p>
+      </li>
+      <li>
+        <h3>Adaptive compression</h3>
+        <p>
+          Whether to compress is currently a guess from the file's type. Better
+          to compress the first chunk, measure the ratio it actually achieves,
+          and drop to raw for the rest when it is not paying for itself.
         </p>
       </li>
       <li>
         <h3>Resume an interrupted transfer</h3>
         <p>
-          A dropped connection now recovers the session, but the file in flight
-          restarts from zero. Resuming from an offset needs the receiver to
-          report how much it committed to disk, which only works reliably on the
-          File System Access path.
+          A dropped connection recovers the session, but the file in flight
+          restarts from zero.
         </p>
       </li>
       <li>
         <h3>More than two devices</h3>
-        <p>
-          A session holds exactly one pair. Sending to a laptop and a phone at
-          once means two links.
-        </p>
+        <p>A session holds exactly one pair; two recipients means two links.</p>
       </li>
       <li>
         <h3>Verify on real iOS and Firefox</h3>
         <p>
-          Every automated check runs in one Chromium browser. The fallbacks for
-          Safari and Firefox are exercised by simulating a missing API, which is
-          not the same as running there.
+          Every automated check runs in one Chromium browser. The Safari and
+          Firefox fallbacks are exercised by simulating a missing API, which
+          proves the fallback code but is not the same as running there.
         </p>
       </li>
     </ol>
@@ -75,6 +87,72 @@
 
   <section class="panel">
     <h2 class="sect">Releases</h2>
+
+    <article class="rel">
+      <h3>v1.2 <time datetime="2026-08-23">23 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Transfers are 49% faster</strong> — 8.7 MB/s to 13 MB/s on the
+          same measurement, byte-for-byte verified. Three separate causes:
+        </li>
+        <li>
+          PeerJS was running its default <code>binary</code> serialization,
+          which packs every message and then re-splits it into 16 KB pieces,
+          undoing the negotiated 256 KB chunk size. Switching to
+          <code>raw</code> removes an encode and decode pass per chunk.
+        </li>
+        <li>
+          The uncompressed path no longer builds a stream, re-chunks it and
+          copies each piece. Slicing the file directly yields buffers that are
+          already exactly one chunk and already ours, so they reach the wire
+          untouched, and reads run one chunk ahead so disk and network overlap.
+        </li>
+        <li>
+          <strong>The payload is striped across parallel data channels.</strong>
+          A raw channel carrying no application logic measured the same
+          10.5 MB/s as dropline did, so the engine was already at the SCTP
+          ceiling and the only way past it was more channels — measured 14.1 on
+          two, 15.0 on four, 16.0 on eight. Ordering needs no per-chunk header:
+          chunk <em>i</em> goes to channel <em>i mod N</em> and each channel is
+          ordered on its own, so the <em>k</em>-th arrival on channel <em>c</em>
+          is globally chunk <em>k·N+c</em>.
+        </li>
+        <li>
+          <strong>The interface adapts to the device.</strong> Memory, cores,
+          network type, data-saver, battery, pointer and viewport are scored
+          into a tier, and that drives chunk size, seal interval, receive
+          watermark, repaint rate, thumbnails and how much it animates — so a
+          cheap phone on a dying battery does less work rather than the same
+          work more slowly. Recomputed on resize, rotation, network and battery
+          changes.
+        </li>
+        <li>
+          <strong>Sessions are authenticated.</strong> The link carries a secret
+          after <code>~</code>; fragments are never sent to a server, so the
+          signalling broker learns the session id and nothing else. Both ends
+          prove they hold it before any transfer is accepted, and a
+          four-character code is shown on both devices to compare. Links
+          without a secret still work and say plainly that they are unverified.
+        </li>
+        <li>
+          Installable, with an offline shell. Caching a static site is normally
+          how stale code gets served — safe here only because the build
+          fingerprints its own output, so those files are immutable by
+          construction while HTML and config stay network-first.
+        </li>
+        <li>
+          Connection quality is shown: direct or relayed, with round-trip time.
+        </li>
+      </ul>
+      <p class="credit">
+        Four bugs surfaced building this. The worst: PeerJS's negotiator claims
+        <em>any</em> arriving data channel as its own connection's, so every
+        stripe re-initialised the session, regenerated the authentication nonce
+        and left control messages on the wrong channel. Fixing it needed the
+        platform's internal handler slot cleared, not merely the JavaScript
+        property overridden.
+      </p>
+    </article>
 
     <article class="rel">
       <h3>v1.1 <time datetime="2026-08-23">23 Aug 2026</time></h3>
