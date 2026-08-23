@@ -106,23 +106,51 @@ DL.util = (function () {
      here: truncation, reordering, a dropped chunk. It is a corruption check,
      not a tamper check, and is not relied on for security. */
 
-  const CRC_TABLE = (function () {
-    const table = new Uint32Array(256);
+  // Slicing-by-8: eight tables let this consume eight bytes per iteration
+  // instead of one. At transfer speeds the byte-at-a-time loop is real time.
+  const CRC_TABLES = (function () {
+    const tables = [];
+    const first = new Uint32Array(256);
     for (let i = 0; i < 256; i++) {
       let c = i;
       for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-      table[i] = c >>> 0;
+      first[i] = c >>> 0;
     }
-    return table;
+    tables.push(first);
+    for (let n = 1; n < 8; n++) {
+      const prev = tables[n - 1];
+      const next = new Uint32Array(256);
+      for (let i = 0; i < 256; i++) {
+        const v = prev[i];
+        next[i] = (first[v & 0xFF] ^ (v >>> 8)) >>> 0;
+      }
+      tables.push(next);
+    }
+    return tables;
   })();
+
+  const T0 = CRC_TABLES[0], T1 = CRC_TABLES[1], T2 = CRC_TABLES[2], T3 = CRC_TABLES[3];
+  const T4 = CRC_TABLES[4], T5 = CRC_TABLES[5], T6 = CRC_TABLES[6], T7 = CRC_TABLES[7];
 
   const crcInit = () => 0xFFFFFFFF;
 
   function crcUpdate(state, bytes) {
     let c = state >>> 0;
-    for (let i = 0; i < bytes.length; i++) {
-      c = (CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8)) >>> 0;
+    const len = bytes.length;
+    let i = 0;
+    while (len - i >= 8) {
+      c = (c ^ (bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24))) >>> 0;
+      c = (T7[c & 0xFF]
+         ^ T6[(c >>> 8) & 0xFF]
+         ^ T5[(c >>> 16) & 0xFF]
+         ^ T4[(c >>> 24) & 0xFF]
+         ^ T3[bytes[i + 4]]
+         ^ T2[bytes[i + 5]]
+         ^ T1[bytes[i + 6]]
+         ^ T0[bytes[i + 7]]) >>> 0;
+      i += 8;
     }
+    while (i < len) c = (T0[(c ^ bytes[i++]) & 0xFF] ^ (c >>> 8)) >>> 0;
     return c >>> 0;
   }
 

@@ -73,29 +73,58 @@ DL.transfer = (function () {
     const high = Math.max(1 << 20, size * 8);
     const channel = conn.dataChannel;
 
-    let read = 0;
     let wire = 0;
     let crc = DL.util.crcInit();
 
-    // Checksummed before compression so both ends hash the same plaintext.
+    const ready = async (view) => {
+      await opts.flow.wait();                       // receiver is behind
+      if (channel && channel.bufferedAmount > high) await drain(channel, high >> 1);
+      if (!opts.isLive()) throw new Error('connection lost');
+    };
+
+    // ── uncompressed: straight from disk to the wire ──
+    // Slicing the file directly yields buffers that are already exactly one
+    // chunk and already owned by us, so there is no stream to drive, nothing
+    // to re-chunk, and no copy before send. Reads run one chunk ahead so disk
+    // and network overlap instead of taking turns.
+    if (!opts.gzip) {
+      const readAt = (off) => file.slice(off, Math.min(off + size, file.size)).arrayBuffer();
+      let next = file.size ? readAt(0) : null;
+
+      for (let off = 0; off < file.size; off += size) {
+        const buf = await next;
+        const following = off + size;
+        next = following < file.size ? readAt(following) : null;
+
+        crc = DL.util.crcUpdate(crc, new Uint8Array(buf));
+        opts.onProgress(off + buf.byteLength);
+
+        await ready();
+        conn.send(buf);                             // no copy: we own this buffer
+        wire += buf.byteLength;
+      }
+      return { read: file.size, wire, crc: DL.util.crcFinal(crc) };
+    }
+
+    // ── compressed: the gzip stream decides its own chunk boundaries ──
+    let read = 0;
     let stream = file.stream().pipeThrough(new TransformStream({
       transform(chunk, ctrl) {
         read += chunk.byteLength;
-        crc = DL.util.crcUpdate(crc, chunk);
+        crc = DL.util.crcUpdate(crc, chunk);        // hash the plaintext
         opts.onProgress(read);
         ctrl.enqueue(chunk);
       },
-    }));
-    if (opts.gzip) stream = stream.pipeThrough(new CompressionStream('gzip'));
+    })).pipeThrough(new CompressionStream('gzip'));
 
     const reader = stream.getReader();
     let pending = new Uint8Array(0);
 
     const push = async (view) => {
-      await opts.flow.wait();                       // receiver is behind
-      if (channel && channel.bufferedAmount > high) await drain(channel, high >> 1);
-      if (!opts.isLive()) throw new Error('connection lost');
-      conn.send(view.slice().buffer);               // copy: view aliases a reused buffer
+      await ready();
+      conn.send(view.buffer.byteLength === view.byteLength && view.byteOffset === 0
+        ? view.buffer
+        : view.slice().buffer);
       wire += view.byteLength;
     };
 

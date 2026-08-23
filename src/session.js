@@ -164,7 +164,11 @@ DL.session = (function () {
     function dial() {
       if (closed || !peer || peer.destroyed) return;
       emit('status', retry ? 'reconnecting' : 'connecting');
-      adopt(peer.connect(hostId, { reliable: true }));
+      // serialization 'none' hands bytes straight to the data channel. The
+      // default 'binary' mode BinaryPacks every message and re-splits it into
+      // 16 KB pieces, which undoes the negotiated chunk size and costs a full
+      // encode/decode pass per chunk.
+      adopt(peer.connect(hostId, { reliable: true, serialization: 'none' }));
     }
 
     function scheduleRetry() {
