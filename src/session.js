@@ -379,13 +379,15 @@ DL.session = (function () {
 
       /* ── connection lifecycle ── */
 
+      let handlers = null;
+
       function attach(c) {
         conn = c;
         let chain = Promise.resolve();
         handshakeDone = false;
         shieldWhenReady(c);
 
-        c.on('open', async () => {
+        const onOpen = async () => {
           note('open', { role: isHost ? 'host' : 'guest', link: link.id, repeat: handshakeDone });
           if (handshakeDone) { flushOutbox(); return; }   // never redo the handshake
           handshakeDone = true;
@@ -409,17 +411,17 @@ DL.session = (function () {
           describeLink().then((q) => { if (q) emit('link-quality', { ...q, from: link.id }); });
           setTimeout(() => describeLink().then((q) => { if (q) emit('link-quality', { ...q, from: link.id }); }), 2500);
           resumeOrPump();
-        });
+        };
 
         // Serialised: converting a Blob is async, and overlapping handlers
         // would enqueue chunks out of order and silently corrupt a file.
-        c.on('data', (data) => {
+        const onData = (data) => {
           chain = chain.then(() => route(data)).catch((err) => {
             emit('error', `Transfer failed: ${err && err.message ? err.message : err}`);
           });
-        });
+        };
 
-        c.on('close', () => {
+        const onClose = () => {
           note('close', { link: link.id });
           if (closed) return;
           pauseActiveTransfers();
@@ -433,9 +435,37 @@ DL.session = (function () {
           } else {
             scheduleRetry();
           }
-        });
+        };
 
-        c.on('error', () => { /* close follows; handled there */ });
+        const onError = () => { /* close follows; handled there */ };
+
+        handlers = { onOpen, onData, onClose, onError };
+        c.on('open', onOpen);
+        c.on('data', onData);
+        c.on('close', onClose);
+        c.on('error', onError);
+
+        // Adopting a connection that has already opened: 'open' fired while it
+        // belonged to the temporary link and will not fire again, so the
+        // post-open work has to be run directly or this link never starts.
+        if (c.open) onOpen();
+      }
+
+      // Handing this link's connection away: its listeners must come off, or
+      // the old and new links both route every message.
+      function takeConn() {
+        const c = conn;
+        if (c && handlers) {
+          try {
+            c.off('open', handlers.onOpen);
+            c.off('data', handlers.onData);
+            c.off('close', handlers.onClose);
+            c.off('error', handlers.onError);
+          } catch { /* emitter without off(); the link is discarded anyway */ }
+        }
+        handlers = null;
+        conn = null;
+        return c;
       }
 
       // Hand a freshly-arrived connection to this existing link, so a
@@ -902,8 +932,7 @@ DL.session = (function () {
 
       Object.assign(link, {
         attach, adoptFrom, enqueue, acceptOffer, declineOffer, describeLink, drop,
-        live,
-        takeConn() { const c = conn; conn = null; return c; },
+        live, takeConn,
       });
 
       // Defined rather than assigned: Object.assign evaluates a getter and
