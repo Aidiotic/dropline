@@ -269,6 +269,11 @@ DL.session = (function () {
       // once the accessor is overridden the platform no longer dispatches to
       // the on-property itself.
       let inner = pc.ondatachannel;
+      // Clearing through the native setter first is what actually matters:
+      // defineProperty only rebinds the JS-visible property, while the handler
+      // PeerJS already assigned lives in the platform's internal slot and
+      // would keep being dispatched.
+      pc.ondatachannel = null;
       const wrapper = (ev) => {
         const label = ev && ev.channel && ev.channel.label;
         if (label && label.startsWith(DL.stripe.LABEL)) return;   // ours, not PeerJS's
