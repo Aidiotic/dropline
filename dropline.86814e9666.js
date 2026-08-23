@@ -1081,7 +1081,7 @@ DL.session = (function () {
       conn = c;
       let chain = Promise.resolve();
       let handshakeDone = false;
-      shieldPeerJs(c);
+      shieldWhenReady(c);
 
       c.on('open', async () => {
         note('open', { role: isHost ? 'host' : 'guest', repeat: handshakeDone });
@@ -1136,20 +1136,39 @@ DL.session = (function () {
     // wrong channel to send control messages on. Keep ours away from it;
     // addEventListener listeners still fire, so collection is unaffected.
     function shieldPeerJs(c) {
-      const pc = c.peerConnection;
-      if (!pc || pc.__droplineShielded) return;
+      const pc = c && c.peerConnection;
+      if (!pc || pc.__droplineShielded) return !!pc;
       pc.__droplineShielded = true;
+
+      // Capture whatever PeerJS has already installed, then take ownership of
+      // the property so later assignments land in `inner` instead of the
+      // platform's handler slot. The wrapper is registered explicitly, because
+      // once the accessor is overridden the platform no longer dispatches to
+      // the on-property itself.
       let inner = pc.ondatachannel;
+      const wrapper = (ev) => {
+        const label = ev && ev.channel && ev.channel.label;
+        if (label && label.startsWith(DL.stripe.LABEL)) return;   // ours, not PeerJS's
+        if (typeof inner === 'function') inner.call(pc, ev);
+      };
+
       Object.defineProperty(pc, 'ondatachannel', {
         configurable: true,
         get() { return inner; },
         set(fn) { inner = fn; },
       });
-      pc.addEventListener('datachannel', (ev) => {
-        if (ev.channel && ev.channel.label && ev.channel.label.startsWith(DL.stripe.LABEL)) {
-          ev.stopImmediatePropagation();
-        }
-      }, true);   // capture phase, so this runs before PeerJS's own listener
+      pc.addEventListener('datachannel', wrapper);
+      return true;
+    }
+
+    // peerConnection may not exist the instant a connection is created, and
+    // the shield has to be in place before any stripe channel arrives.
+    function shieldWhenReady(c) {
+      if (shieldPeerJs(c)) return;
+      let tries = 0;
+      const timer = setInterval(() => {
+        if (shieldPeerJs(c) || ++tries > 40) clearInterval(timer);
+      }, 25);
     }
 
     // One side creates the channels and the other adopts them; both may then
@@ -1158,6 +1177,7 @@ DL.session = (function () {
     function setupStripes(c) {
       const pc = c.peerConnection;
       if (!pc) return;
+      shieldPeerJs(c);
       stripeCount = DL.stripe.countFor();
 
       const attach = (channels) => {
