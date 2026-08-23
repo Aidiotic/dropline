@@ -373,6 +373,12 @@ DL.ui = (function () {
     show(isGuest ? 'session' : 'invite');
     setStatus(isGuest ? 'connecting' : 'idle');
 
+    // The host learns its link from the session; a guest already has it in the
+    // address bar, and without this its Copy button would copy an empty string.
+    if (isGuest && el.sessionLink) {
+      el.sessionLink.value = `${location.origin}${location.pathname}#${hash}`;
+    }
+
     session = DL.session.create({
       role: isGuest ? 'guest' : 'host',
       hostId: isGuest ? hash : null,
