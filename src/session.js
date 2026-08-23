@@ -239,6 +239,7 @@ DL.session = (function () {
       let conn = initialConn;
       let authed = !secret;
       let myNonce = null;
+      let challenges = 0;
       let helloSeen = false;
       let handshakeDone = false;
 
@@ -554,10 +555,21 @@ DL.session = (function () {
               note('auth-ok');
               authed = true;
               emit('authenticated', true);
+              break;
+            }
+
+            // Not necessarily an impostor. A device rejoining is briefly held
+            // by a temporary link that issues its own challenge, so a proof
+            // answering that earlier one lands here after this link has
+            // issued a fresh nonce. Closing on that would kill a good
+            // connection, so re-challenge instead and stay unauthenticated
+            // until an answer matches -- manifests are refused meanwhile.
+            note('auth-mismatch', { got: String(msg.value).slice(0, 8), want: want.slice(0, 8) });
+            if (++challenges <= 3) {
+              myNonce = newSecret();
+              send(P.auth(myNonce));
             } else {
-              note('auth-mismatch', { got: String(msg.value).slice(0, 8), want: want.slice(0, 8) });
               emit('error', 'The other device could not prove it holds this link.');
-              drop();
             }
             break;
           }
