@@ -113,6 +113,13 @@ DL.session = (function () {
     // Inbound backpressure bookkeeping.
     const inbound = { held: false, sink: null };
 
+    // Striped payload transport; null until the extra channels are open, and
+    // everything falls back to the single control channel if they never are.
+    let stripeWriter = null;
+    let stripeReader = null;
+    let stripeCount = 0;
+    let beginAckWaiter = null;
+
     const outQueue = [];
     let sending = false;
 
@@ -193,13 +200,15 @@ DL.session = (function () {
         helloSeen = false;
         authed = !secret;
         gate.release();
-        c.send(P.hello(options.name || 'someone'));
+        c.send(P.hello(options.name || 'someone', DL.stripe.countFor()));
 
         if (secret) {
           myNonce = newSecret();
           c.send(P.auth(myNonce));
           emit('code', await shortCode(secret));
         }
+
+        setupStripes(c);
 
         emit('status', 'connected');
         describeLink().then((link) => { if (link) emit('link-quality', link); });
@@ -225,6 +234,32 @@ DL.session = (function () {
       });
 
       c.on('error', () => { /* close follows; handled there */ });
+    }
+
+    // One side creates the channels and the other adopts them; both may then
+    // send, since a data channel is duplex. Failure here is not fatal -- the
+    // transfer simply runs on the control channel as before.
+    function setupStripes(c) {
+      const pc = c.peerConnection;
+      if (!pc) return;
+      stripeCount = DL.stripe.countFor();
+
+      const attach = (channels) => {
+        if (!channels) return;
+        stripeWriter = DL.stripe.writer(channels, { high: 2 * 1024 * 1024 });
+        stripeReader = DL.stripe.reader(channels, (chunk) => {
+          if (incoming && incoming.sink) incoming.sink.enqueue(chunk);
+        });
+        emit('transport', { stripes: channels.length });
+      };
+
+      if (isHost) {
+        DL.stripe.create(pc, stripeCount)
+          .then(attach)
+          .catch(() => { stripeCount = 0; });
+      } else {
+        DL.stripe.collect(pc, stripeCount, attach);
+      }
     }
 
     function failActiveTransfers(reason) {
@@ -343,8 +378,15 @@ DL.session = (function () {
           break;
         }
 
-        case P.T.BEGIN: await beginItem(msg.itemId); break;
-        case P.T.END:   await endItem(msg.itemId, msg.crc, msg.bytes); break;
+        case P.T.BEGIN:
+          await beginItem(msg.itemId);
+          send(P.beginAck(msg.itemId));   // control and payload are separate
+          break;                          // channels; never assume an order
+
+        case P.T.BEGIN_ACK:
+          if (beginAckWaiter) { const w = beginAckWaiter; beginAckWaiter = null; w(); }
+          break;
+        case P.T.END:   await endItem(msg.itemId, msg.crc, msg.bytes, msg.chunks); break;
 
         case P.T.DONE:
           if (incoming) { emit('batchDone', incoming); incoming = null; }
@@ -376,6 +418,7 @@ DL.session = (function () {
       incoming.sink = sink;
       inbound.sink = sink;
       inbound.held = false;
+      if (stripeReader) stripeReader.reset();
 
       const tick = DL.util.throttle(() => emit('item', { ...item }), DL.device.profile.repaintMs);
 
@@ -409,8 +452,17 @@ DL.session = (function () {
       });
     }
 
-    async function endItem(itemId, expectedCrc, expectedBytes) {
+    async function endItem(itemId, expectedCrc, expectedBytes, chunkCount) {
       if (!incoming) return;
+
+      // Payload rode the stripes, so wait for the reported number of chunks to
+      // be reassembled before closing the stream.
+      if (stripeReader && typeof chunkCount === 'number') {
+        await Promise.race([
+          stripeReader.complete(chunkCount),
+          new Promise((r) => setTimeout(r, 15000)),
+        ]);
+      }
       const item = incoming.items.find((i) => i.id === itemId);
 
       if (incoming.sink) {
@@ -537,16 +589,37 @@ DL.session = (function () {
         const started = Date.now();
         emit('item', { ...item, dir: 'out', state: 'active', done: 0 });
         const tick = DL.util.throttle(
-          (n) => emit('item', { ...item, dir: 'out', state: 'active', done: n }), 70);
+          (n) => emit('item', { ...item, dir: 'out', state: 'active', done: n }),
+          DL.device.profile.repaintMs);
 
+        // The receiver must be listening before payload starts, because it
+        // travels on different channels from this message.
+        const acked = new Promise((resolve) => { beginAckWaiter = resolve; });
         send(P.begin(item.id));
-        const { wire: onWire, crc } = await DL.transfer.pumpFile(conn, entry.file, {
+        await Promise.race([acked, new Promise((r) => setTimeout(r, 8000))]);
+        beginAckWaiter = null;
+
+        const sctp = conn.peerConnection && conn.peerConnection.sctp;
+        const chunkSize = Math.min(
+          DL.util.chunkSize(sctp && sctp.maxMessageSize),
+          DL.device.profile.chunkCap,
+        );
+
+        const write = stripeWriter
+          ? (buf) => stripeWriter.send(buf)
+          : (buf) => { conn.send(buf); };
+
+        const { wire: onWire, crc, chunks } = await DL.transfer.pumpFile(entry.file, {
           gzip: entry.gzip,
           flow: gate,
           isLive: live,
           onProgress: tick,
+          chunkSize,
+          write,
         });
-        send(P.end(item.id, crc, item.size));
+
+        if (stripeWriter) await stripeWriter.flush();
+        send(P.end(item.id, crc, item.size, stripeWriter ? chunks : undefined));
 
         emit('item', {
           ...item, dir: 'out', state: 'done', done: item.size,

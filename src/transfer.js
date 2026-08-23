@@ -64,21 +64,15 @@ DL.transfer = (function () {
 
   /* ── sending ── */
 
-  async function pumpFile(conn, file, opts) {
-    const sctp = conn.peerConnection && conn.peerConnection.sctp;
-    const size = Math.min(
-      DL.util.chunkSize(sctp && sctp.maxMessageSize),
-      DL.device.profile.chunkCap,
-    );
-    const high = Math.max(1 << 20, size * 8);
-    const channel = conn.dataChannel;
+  async function pumpFile(file, opts) {
+    const size = opts.chunkSize;
 
     let wire = 0;
     let crc = DL.util.crcInit();
 
-    const ready = async (view) => {
+    let chunks = 0;
+    const ready = async () => {
       await opts.flow.wait();                       // receiver is behind
-      if (channel && channel.bufferedAmount > high) await drain(channel, high >> 1);
       if (!opts.isLive()) throw new Error('connection lost');
     };
 
@@ -100,10 +94,11 @@ DL.transfer = (function () {
         opts.onProgress(off + buf.byteLength);
 
         await ready();
-        conn.send(buf);                             // no copy: we own this buffer
+        await opts.write(buf);                      // no copy: we own this buffer
         wire += buf.byteLength;
+        chunks++;
       }
-      return { read: file.size, wire, crc: DL.util.crcFinal(crc) };
+      return { read: file.size, wire, chunks, crc: DL.util.crcFinal(crc) };
     }
 
     // ── compressed: the gzip stream decides its own chunk boundaries ──
@@ -122,10 +117,11 @@ DL.transfer = (function () {
 
     const push = async (view) => {
       await ready();
-      conn.send(view.buffer.byteLength === view.byteLength && view.byteOffset === 0
+      await opts.write(view.buffer.byteLength === view.byteLength && view.byteOffset === 0
         ? view.buffer
         : view.slice().buffer);
       wire += view.byteLength;
+      chunks++;
     };
 
     try {
@@ -145,7 +141,7 @@ DL.transfer = (function () {
       reader.cancel().catch(() => {});
     }
 
-    return { read, wire, crc: DL.util.crcFinal(crc) };
+    return { read, wire, chunks, crc: DL.util.crcFinal(crc) };
   }
 
   function concat(a, b) {

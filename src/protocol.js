@@ -13,7 +13,8 @@ DL.protocol = (function () {
     MANIFEST: 'manifest',  // here is a batch of items I would like to send
     ACCEPT:   'accept',
     DECLINE:  'decline',
-    BEGIN:    'begin',     // binary frames after this belong to itemId
+    BEGIN:    'begin',     // payload after this belongs to itemId
+    BEGIN_ACK: 'beginack', // receiver is listening; safe to stream
     END:      'end',
     TEXT:     'text',      // small payload carried inline, no binary frames
     DONE:     'done',
@@ -24,8 +25,8 @@ DL.protocol = (function () {
     BYE:      'bye',
   };
 
-  function hello(name) {
-    return JSON.stringify({ t: T.HELLO, v: VERSION, name });
+  function hello(name, stripes) {
+    return JSON.stringify({ t: T.HELLO, v: VERSION, name, stripes });
   }
 
   // `entries` are {name, size, mime, kind}. Names are made unique and stripped
@@ -47,8 +48,9 @@ DL.protocol = (function () {
 
   const accept  = (batchId) => JSON.stringify({ t: T.ACCEPT, batchId });
   const decline = (batchId, reason) => JSON.stringify({ t: T.DECLINE, batchId, reason });
-  const begin   = (itemId) => JSON.stringify({ t: T.BEGIN, itemId });
-  const end     = (itemId, crc, bytes) => JSON.stringify({ t: T.END, itemId, crc, bytes });
+  const begin    = (itemId) => JSON.stringify({ t: T.BEGIN, itemId });
+  const beginAck = (itemId) => JSON.stringify({ t: T.BEGIN_ACK, itemId });
+  const end     = (itemId, crc, bytes, chunks) => JSON.stringify({ t: T.END, itemId, crc, bytes, chunks });
   const done    = (batchId) => JSON.stringify({ t: T.DONE, batchId });
   const hold    = () => JSON.stringify({ t: T.HOLD });
   const go      = () => JSON.stringify({ t: T.GO });
@@ -84,7 +86,7 @@ DL.protocol = (function () {
     items.reduce((sum, it) => sum + (it.kind === 'file' ? it.size : 0), 0);
 
   return {
-    VERSION, T, hello, manifest, accept, decline, begin, end, done,
+    VERSION, T, hello, manifest, accept, decline, begin, beginAck, end, done,
     hold, go, bye, auth, proof, text, parse, totalBytes,
   };
 })();

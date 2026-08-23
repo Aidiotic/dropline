@@ -19,7 +19,7 @@ const ROOT = __dirname;
 const SRC = path.join(ROOT, 'src');
 
 // Order matters: these are plain scripts sharing a DL namespace, not modules.
-const SCRIPTS = ['util.js', 'device.js', 'protocol.js', 'transfer.js', 'session.js', 'ui.js'];
+const SCRIPTS = ['util.js', 'device.js', 'protocol.js', 'stripe.js', 'transfer.js', 'session.js', 'ui.js'];
 const HTML = ['index.html', 'updates.html'];
 
 const hash = (text) => crypto.createHash('sha256').update(text).digest('hex').slice(0, 10);
