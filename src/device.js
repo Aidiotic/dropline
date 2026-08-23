@@ -52,19 +52,44 @@ DL.device = (function () {
   // machine actually does. Cached: the answer does not change.
   let probed = null;
 
-  function probeThroughput() {
-    if (probed !== null) return probed;
+  function runProbe(rounds) {
     try {
       const sample = new Uint8Array(1 << 20);
       for (let i = 0; i < sample.length; i += 977) sample[i] = i & 0xFF;
-      const started = performance.now();
-      DL.util.crcFinal(DL.util.crcUpdate(DL.util.crcInit(), sample));
-      const seconds = (performance.now() - started) / 1000;
-      probed = seconds > 0 ? 1 / seconds : null;      // MB/s
+      let best = 0;
+      for (let r = 0; r < rounds; r++) {
+        const started = performance.now();
+        DL.util.crcFinal(DL.util.crcUpdate(DL.util.crcInit(), sample));
+        const seconds = (performance.now() - started) / 1000;
+        if (seconds > 0) best = Math.max(best, 1 / seconds);   // MB/s
+      }
+      return best || null;
     } catch {
-      probed = null;
+      return null;
     }
+  }
+
+  // Best of a few rounds, not the first: the first pass pays for a cold cache
+  // and JIT warm-up, and a background tab is throttled hard enough to make a
+  // fast machine look slow. Taking the best measures capability rather than
+  // whatever the scheduler was doing at that instant.
+  function probeThroughput() {
+    if (probed === null) probed = runProbe(3);
     return probed;
+  }
+
+  // A page that started hidden may have measured badly. Re-measure once it is
+  // visible and keep the better answer.
+  function remeasureWhenVisible() {
+    if (typeof document === 'undefined') return;
+    if (document.visibilityState === 'visible') return;
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      document.removeEventListener('visibilitychange', onVisible);
+      const again = runProbe(3);
+      if (again && (!probed || again > probed)) { probed = again; recompute(); }
+    };
+    document.addEventListener('visibilitychange', onVisible);
   }
 
   function watchBattery() {
@@ -208,6 +233,7 @@ DL.device = (function () {
   function init() {
     recompute();
     watchBattery();
+    remeasureWhenVisible();
 
     if (typeof window !== 'undefined') {
       let resizeTimer = null;
