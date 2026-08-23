@@ -1,0 +1,219 @@
+:root {
+  --bg: #0e1116;
+  --card: #171b22;
+  --line: #262c36;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #4a9eff;
+  --accent-dim: #1f3a5f;
+  --ok: #3fb950;
+  --bad: #f85149;
+  --radius: 12px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f6fa;
+    --card: #ffffff;
+    --line: #e2e6ed;
+    --text: #1c2128;
+    --muted: #656d76;
+    --accent-dim: #dbeafe;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.card {
+  width: 100%;
+  max-width: 520px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 32px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .18);
+}
+
+h1 {
+  margin: 0;
+  font-size: 26px;
+  letter-spacing: -.02em;
+}
+
+.tagline {
+  margin: 6px 0 24px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+/* ── dropzone ── */
+#dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 44px 20px;
+  border: 2px dashed var(--line);
+  border-radius: var(--radius);
+  cursor: pointer;
+  text-align: center;
+  transition: border-color .15s, background .15s;
+}
+
+#dropzone:hover,
+#dropzone.hot {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+#dropzone svg {
+  width: 34px;
+  height: 34px;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+#dropzone span { color: var(--muted); font-size: 13px; }
+
+/* ── file row ── */
+.file-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 18px;
+}
+
+.file-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-size { color: var(--muted); font-size: 13px; flex-shrink: 0; }
+
+/* ── link row ── */
+.hint { font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+
+.linkrow { display: flex; gap: 8px; }
+
+#share-link {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+button, .primary {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  padding: 10px 16px;
+  transition: opacity .15s, background .15s;
+}
+
+#copy-btn, .primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+#copy-btn:hover, .primary:hover { opacity: .88; }
+
+.primary {
+  display: block;
+  margin-top: 18px;
+  text-align: center;
+  text-decoration: none;
+}
+
+.ghost {
+  display: block;
+  width: 100%;
+  margin-top: 20px;
+  background: transparent;
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+.ghost:hover { border-color: var(--accent); color: var(--text); }
+
+/* ── progress ── */
+.bar {
+  height: 7px;
+  border-radius: 99px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 99px;
+  background: var(--accent);
+  transition: width .12s linear;
+}
+
+.bar-fill.done { background: var(--ok); }
+
+.status {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: .25; }
+  50%      { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse { animation: none; opacity: 1; }
+  .bar-fill { transition: none; }
+}
+
+.error { color: var(--bad); margin: 0; font-size: 14px; }
+
+footer {
+  margin-top: 26px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}

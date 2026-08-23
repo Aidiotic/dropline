@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dropline — direct file transfer</title>
+<meta name="description" content="Send a file straight to someone's browser. Nothing is uploaded to a server.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
+</head>
+<body>
+
+<main class="card">
+  <header>
+    <h1>dropline</h1>
+    <p class="tagline">Files go straight from your browser to theirs. Nothing touches a server.</p>
+  </header>
+
+  <!-- ── Pick a file ─────────────────────────────────────────── -->
+  <section id="panel-pick" class="panel">
+    <label id="dropzone" for="file-input">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L8 8m4-4 4 4M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+      <strong>Drop a file here</strong>
+      <span>or click to choose one</span>
+    </label>
+    <input type="file" id="file-input" hidden>
+  </section>
+
+  <!-- ── Sharing (sender) ────────────────────────────────────── -->
+  <section id="panel-share" class="panel" hidden>
+    <div class="file-row">
+      <span class="file-name" id="share-name"></span>
+      <span class="file-size" id="share-size"></span>
+    </div>
+
+    <div id="share-link-box">
+      <p class="hint">Send this link to your friend. <strong>Keep this tab open</strong> until the transfer finishes.</p>
+      <div class="linkrow">
+        <input type="text" id="share-link" readonly spellcheck="false">
+        <button id="copy-btn" type="button">Copy</button>
+      </div>
+      <p class="status" id="share-status"><span class="pulse"></span> Waiting for them to open the link…</p>
+    </div>
+
+    <div id="share-progress" hidden>
+      <div class="bar"><div class="bar-fill" id="send-fill"></div></div>
+      <p class="status" id="send-status"></p>
+    </div>
+
+    <button class="ghost" id="share-reset" type="button">Send a different file</button>
+  </section>
+
+  <!-- ── Receiving ───────────────────────────────────────────── -->
+  <section id="panel-receive" class="panel" hidden>
+    <div class="file-row">
+      <span class="file-name" id="recv-name">Connecting…</span>
+      <span class="file-size" id="recv-size"></span>
+    </div>
+    <div class="bar"><div class="bar-fill" id="recv-fill"></div></div>
+    <p class="status" id="recv-status"><span class="pulse"></span> Reaching the sender…</p>
+    <a class="primary" id="save-btn" hidden download>Save file</a>
+  </section>
+
+  <!-- ── Errors ──────────────────────────────────────────────── -->
+  <section id="panel-error" class="panel" hidden>
+    <p class="error" id="error-msg"></p>
+    <button class="ghost" id="error-reset" type="button">Start over</button>
+  </section>
+
+  <footer>
+    <span id="footer-note">Peer-to-peer over WebRTC · encrypted in transit</span>
+  </footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"
+        integrity="sha384-x0YgkOr/3UOZP2CRDxGW9e0Q+2Qjyr3uJrm4xU32Y7ZCNAo7Cc7bjhrZMi/dwczu"
+        crossorigin="anonymous"></script>
+<script src="app.js"></script>
+</body>
+</html>
