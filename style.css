@@ -25,6 +25,11 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/* The hidden attribute only gets display:none from the UA sheet, which any
+   author rule setting display outranks — .btn is display:block and would
+   otherwise keep rendering while hidden. */
+[hidden] { display: none !important; }
+
 html { -webkit-text-size-adjust: 100%; }
 
 body {
