@@ -276,8 +276,19 @@ const drain = (channel, low) => new Promise((resolve) => {
 
 /* ── receiving ────────────────────────────────────────────────── */
 
+function resetReceive() {
+  els.acceptBtn.hidden = true;
+  els.saveLink.hidden = true;
+  els.recvProgress.hidden = true;
+  els.recvFill.classList.remove('done');
+  els.recvFill.style.width = '0';
+  els.recvStatus.textContent = '';
+  els.recvName.textContent = 'Connecting';
+}
+
 function startReceiving(hostId) {
   teardown();
+  resetReceive();
   show('panel-receive');
   live(els.recvSub, 'Reaching the sender…');
 
@@ -428,11 +439,8 @@ els.copyBtn.addEventListener('click', async () => {
 for (const id of ['share-reset', 'error-reset']) {
   $(id).addEventListener('click', () => {
     teardown();
+    resetReceive();
     els.fileInput.value = '';
-    els.saveLink.hidden = true;
-    els.acceptBtn.hidden = true;
-    els.recvProgress.hidden = true;
-    els.recvFill.classList.remove('done');
     history.replaceState(null, '', location.pathname);
     show('panel-pick');
   });
@@ -443,6 +451,13 @@ window.addEventListener('beforeunload', (e) => {
   if (midSend) { e.preventDefault(); e.returnValue = ''; }
 });
 
-const hash = location.hash.slice(1);
-if (hash.startsWith(ID_PREFIX)) startReceiving(hash);
-else show('panel-pick');
+// Opening a second link in an already-loaded tab only fires hashchange, so
+// routing has to run on that too — otherwise the page sits on the stale file.
+function route() {
+  const hash = location.hash.slice(1);
+  if (hash.startsWith(ID_PREFIX)) startReceiving(hash);
+  else show('panel-pick');
+}
+
+window.addEventListener('hashchange', route);
+route();
