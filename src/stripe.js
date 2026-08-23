@@ -28,10 +28,7 @@ DL.stripe = (function () {
   const OPEN_TIMEOUT = 4000;
 
   function countFor() {
-    const tier = DL.device.profile.tier;
-    if (tier === 'minimal' || tier === 'low') return 2;
-    if (tier === 'ultra') return 6;
-    return 4;
+    return DL.device.profile.stripes || 1;
   }
 
   // Only one side creates the channels; the other picks them up via

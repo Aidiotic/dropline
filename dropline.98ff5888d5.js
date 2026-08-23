@@ -231,11 +231,33 @@ DL.device = (function () {
       landscape: w > h,
       dpr: typeof devicePixelRatio === 'number' ? devicePixelRatio : 1,
       battery: batteryState,
+      throughput: probeThroughput(),   // MB/s, measured
     };
   }
 
   // Battery is async and may be unavailable; kept in a slot the sync read uses.
   let batteryState = { level: null, charging: null };
+
+  // Measured, not claimed. navigator.deviceMemory is coarse and, per spec, may
+  // be clamped -- it cannot separate a 2 GB netbook from a workstation. Timing
+  // real work over a megabyte takes a couple of milliseconds and says what the
+  // machine actually does. Cached: the answer does not change.
+  let probed = null;
+
+  function probeThroughput() {
+    if (probed !== null) return probed;
+    try {
+      const sample = new Uint8Array(1 << 20);
+      for (let i = 0; i < sample.length; i += 977) sample[i] = i & 0xFF;
+      const started = performance.now();
+      DL.util.crcFinal(DL.util.crcUpdate(DL.util.crcInit(), sample));
+      const seconds = (performance.now() - started) / 1000;
+      probed = seconds > 0 ? 1 / seconds : null;      // MB/s
+    } catch {
+      probed = null;
+    }
+    return probed;
+  }
 
   function watchBattery() {
     if (typeof navigator === 'undefined' || !navigator.getBattery) return;
@@ -257,23 +279,31 @@ DL.device = (function () {
   function tierFor(s) {
     let score = 0;
 
-    if (s.memory !== null) score += s.memory >= 8 ? 2 : s.memory >= 4 ? 1 : -1;
-    else score += 0;                                   // unknown: assume middling
+    if (s.memory !== null) score += s.memory >= 8 ? 2 : s.memory >= 4 ? 1 : s.memory >= 2 ? 0 : -2;
 
-    if (s.cores !== null) score += s.cores >= 8 ? 2 : s.cores >= 4 ? 1 : -1;
+    if (s.cores !== null) {
+      score += s.cores >= 16 ? 3 : s.cores >= 8 ? 2 : s.cores >= 4 ? 1 : s.cores >= 2 ? 0 : -2;
+    }
 
     if (s.effectiveType === '4g') score += 1;
     else if (s.effectiveType === '3g') score -= 1;
     else if (s.effectiveType === '2g' || s.effectiveType === 'slow-2g') score -= 3;
 
+    // The measured figure outranks the advertised one where they disagree.
+    if (s.throughput !== null) {
+      score += s.throughput >= 800 ? 2 : s.throughput >= 400 ? 1 : s.throughput >= 150 ? 0 : -2;
+    }
+
     if (s.saveData) score -= 3;                        // an explicit request
     if (s.battery.level !== null && s.battery.level < 0.2 && !s.battery.charging) score -= 2;
 
-    // 8 GB + 8 cores + 4g scores 5; 4 GB + 4 cores + 4g scores 3, which is a
-    // mid-range machine and should be treated as one.
-    if (score >= 4) return 'high';
-    if (score >= 0) return 'mid';
-    return 'low';
+    // 8 GB / 16 cores / 4g / fast scores 8; 4 GB / 4 cores / 4g / average
+    // scores 4, which is a mid-range machine and should be treated as one.
+    if (score >= 8) return 'ultra';
+    if (score >= 6) return 'high';
+    if (score >= 2) return 'mid';
+    if (score >= -1) return 'low';
+    return 'minimal';
   }
 
   function formFor(s) {
@@ -292,6 +322,7 @@ DL.device = (function () {
     if (s.reduceMotion) return 'none';
     if (s.saveData) return 'minimal';
     if (tier === 'low') return 'minimal';
+    if (tier === 'minimal') return 'none';
     if (s.battery.level !== null && s.battery.level < 0.2 && !s.battery.charging) return 'minimal';
     return 'full';
   }
@@ -299,25 +330,24 @@ DL.device = (function () {
   const MB = 1024 * 1024;
 
   function budgetFor(tier, s) {
-    // Memory-bound knobs scale with the tier; the network-bound one also
-    // respects an explicit save-data request.
+    // Every knob that costs memory, CPU or battery scales together, so a weak
+    // machine does less work rather than the same work more slowly.
     const table = {
-      low:  { seal: 2 * MB, watermark: 1 * MB, chunkCap: 64 * 1024,  repaintMs: 150 },
-      mid:  { seal: 4 * MB, watermark: 4 * MB, chunkCap: 192 * 1024, repaintMs: 90 },
-      high: { seal: 8 * MB, watermark: 8 * MB, chunkCap: 256 * 1024, repaintMs: 60 },
-    }[tier];
+      minimal: { seal: 1 * MB,  watermark: MB / 2, chunkCap: 32 * 1024,  repaintMs: 250, stripes: 1 },
+      low:     { seal: 2 * MB,  watermark: 1 * MB, chunkCap: 64 * 1024,  repaintMs: 150, stripes: 2 },
+      mid:     { seal: 4 * MB,  watermark: 4 * MB, chunkCap: 192 * 1024, repaintMs: 90,  stripes: 3 },
+      high:    { seal: 8 * MB,  watermark: 8 * MB, chunkCap: 256 * 1024, repaintMs: 60,  stripes: 4 },
+      ultra:   { seal: 16 * MB, watermark: 16 * MB, chunkCap: 256 * 1024, repaintMs: 45, stripes: 6 },
+    }[tier] || {
+      seal: 4 * MB, watermark: 4 * MB, chunkCap: 192 * 1024, repaintMs: 90, stripes: 3,
+    };
 
     return {
       ...table,
-      // Thumbnails decode a whole image into memory; not worth it on a phone
+      // Thumbnails decode a whole image into memory; not worth it on a device
       // that is already tight, or when the user asked us to save data.
-      thumbnails: tier !== 'low' && !s.saveData,
-      // Compression is CPU work. On a slow link it pays for itself many times
-      // over; on a fast link with few cores it can be the bottleneck.
-      preferCompression: s.effectiveType === '2g' || s.effectiveType === 'slow-2g'
-        || s.effectiveType === '3g' || s.saveData
-        || (s.cores === null || s.cores >= 4),
-      qrPixels: tier === 'low' ? 132 : 148,
+      thumbnails: tier !== 'low' && tier !== 'minimal' && !s.saveData,
+      qrPixels: tier === 'minimal' || tier === 'low' ? 132 : 148,
     };
   }
 
@@ -332,7 +362,11 @@ DL.device = (function () {
       ...budgetFor(tier, signals),
       // A short human-readable summary, shown in the interface.
       describe() {
-        const bits = [form, tier === 'high' ? 'high performance' : tier === 'low' ? 'power saving' : 'balanced'];
+        const label = {
+          ultra: 'maximum', high: 'high performance', mid: 'balanced',
+          low: 'power saving', minimal: 'lightweight',
+        }[tier] || 'balanced';
+        const bits = [form, label];
         if (signals.saveData) bits.push('data saver');
         return bits.join(' · ');
       },
@@ -524,10 +558,7 @@ DL.stripe = (function () {
   const OPEN_TIMEOUT = 4000;
 
   function countFor() {
-    const tier = DL.device.profile.tier;
-    if (tier === 'minimal' || tier === 'low') return 2;
-    if (tier === 'ultra') return 6;
-    return 4;
+    return DL.device.profile.stripes || 1;
   }
 
   // Only one side creates the channels; the other picks them up via
@@ -1669,7 +1700,9 @@ DL.ui = (function () {
     'act-files', 'act-folder', 'act-text', 'auto-accept', 'text-wrap', 'text-input',
     'send-text', 'transfer-list', 'empty-note', 'session-stats', 'error-msg',
     'error-reset', 'veil', 'verify-code', 'verify-wrap', 'link-quality',
-    'theme-btn', 'install-btn', 'device-note'];
+    'install-btn', 'device-note', 'settings-btn', 'settings', 'pref-theme',
+    'pref-motion', 'pref-perf', 'pref-detected', 'pref-autoaccept',
+    'laufey-choice'];
 
   const key = (id) => id.replace(/-(\w)/g, (_, c) => c.toUpperCase());
 
@@ -2154,7 +2187,6 @@ DL.ui = (function () {
       if (e.key === 'Escape' && !el.offerCard.hidden) declineOffer();
     });
 
-    if (el.themeBtn) el.themeBtn.addEventListener('click', cycleTheme);
     el.errorReset.addEventListener('click', () => { location.href = location.pathname; });
 
     window.addEventListener('beforeunload', (e) => {
@@ -2194,8 +2226,11 @@ DL.ui = (function () {
     DL.device.onChange(applyProfile);
     applyProfile(profile);
 
-    applyStoredTheme();
+    loadPrefs();
     wire();
+    wirePrefs();
+    wireEasterEgg();
+    applyPrefs();
     wireInstall();
     registerWorker();
 
@@ -2241,6 +2276,7 @@ DL.ui = (function () {
   function applyProfile(p) {
     if (el.deviceNote) el.deviceNote.textContent = p.describe();
     if (el.qr) { el.qr.style.width = `${p.qrPixels}px`; el.qr.style.height = `${p.qrPixels}px`; }
+    applyPrefs();   // the profile just wrote the same attributes; choices win
   }
 
   /* ── verification ── */
@@ -2272,30 +2308,130 @@ DL.ui = (function () {
     el.linkQuality.dataset.relayed = String(link.relayed);
   }
 
-  /* ── theme ── */
+  /* ── preferences ──
+     Stored as one object so a private-mode failure to persist degrades to
+     "settings work but are forgotten", never to a broken page. */
 
-  const THEMES = ['system', 'light', 'dark'];
+  const PREF_KEY = 'dropline-prefs';
+  const DEFAULTS = { theme: 'system', motion: 'auto', perf: 'auto', autoAccept: false, laufey: false };
+  let prefs = { ...DEFAULTS };
 
-  function applyStoredTheme() {
-    let saved = 'system';
-    try { saved = localStorage.getItem('dropline-theme') || 'system'; } catch { /* private mode */ }
-    setTheme(THEMES.includes(saved) ? saved : 'system', false);
+  function loadPrefs() {
+    try {
+      const raw = localStorage.getItem(PREF_KEY);
+      if (raw) prefs = { ...DEFAULTS, ...JSON.parse(raw) };
+    } catch { /* private mode, or corrupted -- defaults are fine */ }
   }
 
-  function setTheme(name, save) {
-    document.documentElement.dataset.theme = name;
-    if (el.themeBtn) {
-      el.themeBtn.textContent = name === 'system' ? 'Theme: auto' : `Theme: ${name}`;
-      el.themeBtn.setAttribute('aria-label', `Theme: ${name}. Click to change.`);
-    }
-    if (save !== false) {
-      try { localStorage.setItem('dropline-theme', name); } catch { /* private mode */ }
-    }
+  function savePrefs() {
+    try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch { /* ignore */ }
   }
 
-  function cycleTheme() {
-    const current = document.documentElement.dataset.theme || 'system';
-    setTheme(THEMES[(THEMES.indexOf(current) + 1) % THEMES.length], true);
+  // Re-asserted after every device recompute, because the profile owns those
+  // same attributes and would otherwise overwrite a deliberate choice.
+  function applyPrefs() {
+    const root = document.documentElement;
+    root.dataset.theme = prefs.theme;
+    if (prefs.motion !== 'auto') root.dataset.motion = prefs.motion;
+    if (prefs.perf === 'minimal') root.dataset.tier = 'minimal';
+
+    autoAccept = prefs.autoAccept;
+    if (el.prefAutoaccept) el.prefAutoaccept.checked = prefs.autoAccept;
+    if (el.autoAccept) el.autoAccept.checked = prefs.autoAccept;
+    if (el.laufeyChoice) el.laufeyChoice.hidden = !prefs.laufey;
+
+    check(el.prefTheme, 'theme', prefs.theme);
+    check(el.prefMotion, 'motion', prefs.motion);
+    check(el.prefPerf, 'perf', prefs.perf);
+  }
+
+  function check(group, name, value) {
+    if (!group) return;
+    const input = group.querySelector(`input[name="${name}"][value="${value}"]`);
+    if (input) input.checked = true;
+  }
+
+  function wirePrefs() {
+    if (!el.settings) return;
+
+    el.settingsBtn.addEventListener('click', () => {
+      if (el.prefDetected) {
+        const p = DL.device.profile;
+        const measured = p.signals.throughput;
+        el.prefDetected.textContent =
+          `Detected: ${p.describe()} · ${p.stripes} channel${p.stripes > 1 ? 's' : ''}` +
+          (measured ? ` · ${Math.round(measured)} MB/s measured` : '');
+      }
+      el.settings.showModal();
+    });
+
+    const onChoice = (group, name, key) => {
+      if (!group) return;
+      group.addEventListener('change', (e) => {
+        if (e.target.name !== name) return;
+        prefs[key] = e.target.value;
+        savePrefs();
+        if (key === 'motion' && prefs.motion === 'auto') DL.device.recompute();
+        if (key === 'perf' && prefs.perf === 'auto') DL.device.recompute();
+        applyPrefs();
+        announce(`${name} set to ${e.target.value}`);
+      });
+    };
+
+    onChoice(el.prefTheme, 'theme', 'theme');
+    onChoice(el.prefMotion, 'motion', 'motion');
+    onChoice(el.prefPerf, 'perf', 'perf');
+
+    el.prefAutoaccept.addEventListener('change', () => {
+      prefs.autoAccept = el.prefAutoaccept.checked;
+      savePrefs();
+      applyPrefs();
+    });
+
+    // Clicking outside the sheet closes it, which <dialog> does not do alone.
+    el.settings.addEventListener('click', (e) => {
+      if (e.target === el.settings) el.settings.close();
+    });
+  }
+
+  /* ── easter egg ──
+     Type the word anywhere to unlock a theme that is not otherwise listed. */
+
+  function wireEasterEgg() {
+    const word = 'laufey';
+    let progress = 0;
+    window.addEventListener('keydown', (e) => {
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (e.key && e.key.toLowerCase() === word[progress]) {
+        progress++;
+        if (progress === word.length) {
+          progress = 0;
+          unlockLaufey();
+        }
+      } else {
+        progress = e.key && e.key.toLowerCase() === word[0] ? 1 : 0;
+      }
+    });
+  }
+
+  function unlockLaufey() {
+    const first = !prefs.laufey;
+    prefs.laufey = true;
+    prefs.theme = 'laufey';
+    savePrefs();
+    applyPrefs();
+    announce(first ? 'Laufey theme unlocked' : 'Laufey theme');
+    if (first) flash('✦ laufey unlocked');
+  }
+
+  function flash(text) {
+    const note = document.createElement('div');
+    note.className = 'toast';
+    note.textContent = text;
+    document.body.append(note);
+    setTimeout(() => note.classList.add('out'), 2200);
+    setTimeout(() => note.remove(), 2800);
   }
 
   /* ── offline shell ──

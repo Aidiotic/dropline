@@ -244,42 +244,62 @@ const sig = (over) => Object.assign({
   memory: 4, cores: 4, effectiveType: '4g', downlink: 10, rtt: 50,
   saveData: false, coarse: false, hover: true, reduceMotion: false,
   width: 1400, height: 900, landscape: true, dpr: 2,
-  battery: { level: null, charging: null },
+  battery: { level: null, charging: null }, throughput: 500,
 }, over);
 
 group('device.tier');
 test('a capable machine on a fast link is high', () => {
-  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 8 })), 'high');
+  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 8, throughput: 900 })), 'high');
 });
-test('a weak machine on a slow link is low', () => {
-  assert.strictEqual(device._tierFor(sig({ memory: 2, cores: 2, effectiveType: '2g' })), 'low');
+test('a workstation reaches the top tier', () => {
+  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 24, throughput: 1200 })), 'ultra');
+});
+test('a 2 GB dual-core on 3G lands at the bottom', () => {
+  assert.strictEqual(
+    device._tierFor(sig({ memory: 2, cores: 2, effectiveType: '3g', throughput: 90 })), 'minimal');
+});
+test('a weak machine on a slow link is low or below', () => {
+  const t = device._tierFor(sig({ memory: 2, cores: 2, effectiveType: '2g', throughput: 200 }));
+  assert.ok(t === 'low' || t === 'minimal', `expected low/minimal, got ${t}`);
+});
+test('a measured slow machine is demoted despite good spec sheet numbers', () => {
+  const claimed = device._tierFor(sig({ memory: 8, cores: 8, throughput: 900 }));
+  const measured = device._tierFor(sig({ memory: 8, cores: 8, throughput: 80 }));
+  assert.strictEqual(claimed, 'high');
+  assert.ok(['mid', 'low'].includes(measured), `expected demotion, got ${measured}`);
 });
 test('save-data alone drops the tier, whatever the hardware', () => {
-  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 8, saveData: true })), 'mid');
+  const order = ['minimal', 'low', 'mid', 'high', 'ultra'];
+  const full = device._tierFor(sig({ memory: 8, cores: 8, throughput: 900 }));
+  const saving = device._tierFor(sig({ memory: 8, cores: 8, throughput: 900, saveData: true }));
+  assert.ok(order.indexOf(saving) < order.indexOf(full), `expected a demotion, got ${saving}`);
 });
 test('a mid-range machine is not flattered into the top tier', () => {
-  assert.strictEqual(device._tierFor(sig({ memory: 4, cores: 4 })), 'mid');
+  assert.strictEqual(device._tierFor(sig({ memory: 4, cores: 4, throughput: 500 })), 'mid');
 });
 test('a draining battery pushes a borderline device down a tier', () => {
   // Penalises the score rather than overriding it: plenty of headroom absorbs
   // it, a marginal device does not.
-  const marginal = sig({ memory: 4, cores: 2 });
-  assert.strictEqual(device._tierFor(marginal), 'mid');
-  assert.strictEqual(
-    device._tierFor({ ...marginal, battery: { level: 0.1, charging: false } }), 'low');
+  const marginal = sig({ memory: 4, cores: 2, throughput: 300 });
+  const rested = device._tierFor(marginal);
+  const draining = device._tierFor({ ...marginal, battery: { level: 0.1, charging: false } });
+  const order = ['minimal', 'low', 'mid', 'high', 'ultra'];
+  assert.ok(order.indexOf(draining) < order.indexOf(rested),
+    `expected a demotion, got ${rested} -> ${draining}`);
 });
 test('a draining battery cuts motion even on capable hardware', () => {
-  const flat = sig({ memory: 8, cores: 8, battery: { level: 0.1, charging: false } });
-  assert.strictEqual(device._tierFor(flat), 'mid', 'top-tier hardware steps down one');
+  const flat = sig({ memory: 8, cores: 8, throughput: 900, battery: { level: 0.1, charging: false } });
+  assert.strictEqual(device._tierFor(flat), 'mid', 'capable hardware steps down');
   assert.strictEqual(device._motionFor(flat, 'high'), 'minimal', 'and stops animating');
 });
 test('charging removes the battery penalty entirely', () => {
-  const charging = sig({ memory: 8, cores: 8, battery: { level: 0.1, charging: true } });
+  const charging = sig({ memory: 8, cores: 8, throughput: 900, battery: { level: 0.1, charging: true } });
   assert.strictEqual(device._tierFor(charging), 'high');
   assert.strictEqual(device._motionFor(charging, 'high'), 'full');
 });
-test('unknown hardware lands in the middle rather than assuming the worst', () => {
-  assert.strictEqual(device._tierFor(sig({ memory: null, cores: null })), 'mid');
+test('unknown hardware lands mid-range rather than assuming the worst', () => {
+  const t = device._tierFor(sig({ memory: null, cores: null, throughput: null }));
+  assert.ok(['mid', 'low'].includes(t), `expected mid-ish, got ${t}`);
 });
 
 group('device.form');
@@ -302,15 +322,26 @@ test('low-end and data-saving devices get minimal motion', () => {
 });
 
 group('device.budget');
-test('budgets grow with the tier and never invert', () => {
-  const low = device._budgetFor('low', sig());
-  const high = device._budgetFor('high', sig());
-  assert.ok(low.seal < high.seal);
-  assert.ok(low.watermark < high.watermark);
-  assert.ok(low.chunkCap < high.chunkCap);
-  assert.ok(low.repaintMs > high.repaintMs, 'low tier should repaint less often');
+test('budgets grow monotonically across every tier', () => {
+  const tiers = ['minimal', 'low', 'mid', 'high', 'ultra'].map((t) => device._budgetFor(t, sig()));
+  for (let i = 1; i < tiers.length; i++) {
+    assert.ok(tiers[i].seal >= tiers[i - 1].seal, 'seal must not shrink going up');
+    assert.ok(tiers[i].watermark >= tiers[i - 1].watermark, 'watermark must not shrink');
+    assert.ok(tiers[i].chunkCap >= tiers[i - 1].chunkCap, 'chunk cap must not shrink');
+    assert.ok(tiers[i].repaintMs <= tiers[i - 1].repaintMs, 'repaint must not get slower');
+    assert.ok(tiers[i].stripes >= tiers[i - 1].stripes, 'stripe count must not shrink');
+  }
+});
+test('the weakest tier uses a single channel and the top tier several', () => {
+  assert.strictEqual(device._budgetFor('minimal', sig()).stripes, 1);
+  assert.ok(device._budgetFor('ultra', sig()).stripes >= 4);
+});
+test('an unknown tier still yields a usable budget', () => {
+  const b = device._budgetFor('nonsense', sig());
+  assert.ok(b.seal > 0 && b.chunkCap > 0 && b.stripes >= 1);
 });
 test('thumbnails are dropped on low-end and data-saving devices', () => {
+  assert.strictEqual(device._budgetFor('minimal', sig()).thumbnails, false);
   assert.strictEqual(device._budgetFor('low', sig()).thumbnails, false);
   assert.strictEqual(device._budgetFor('high', sig({ saveData: true })).thumbnails, false);
   assert.strictEqual(device._budgetFor('high', sig()).thumbnails, true);

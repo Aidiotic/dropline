@@ -20,7 +20,9 @@ DL.ui = (function () {
     'act-files', 'act-folder', 'act-text', 'auto-accept', 'text-wrap', 'text-input',
     'send-text', 'transfer-list', 'empty-note', 'session-stats', 'error-msg',
     'error-reset', 'veil', 'verify-code', 'verify-wrap', 'link-quality',
-    'theme-btn', 'install-btn', 'device-note'];
+    'install-btn', 'device-note', 'settings-btn', 'settings', 'pref-theme',
+    'pref-motion', 'pref-perf', 'pref-detected', 'pref-autoaccept',
+    'laufey-choice'];
 
   const key = (id) => id.replace(/-(\w)/g, (_, c) => c.toUpperCase());
 
@@ -505,7 +507,6 @@ DL.ui = (function () {
       if (e.key === 'Escape' && !el.offerCard.hidden) declineOffer();
     });
 
-    if (el.themeBtn) el.themeBtn.addEventListener('click', cycleTheme);
     el.errorReset.addEventListener('click', () => { location.href = location.pathname; });
 
     window.addEventListener('beforeunload', (e) => {
@@ -545,8 +546,11 @@ DL.ui = (function () {
     DL.device.onChange(applyProfile);
     applyProfile(profile);
 
-    applyStoredTheme();
+    loadPrefs();
     wire();
+    wirePrefs();
+    wireEasterEgg();
+    applyPrefs();
     wireInstall();
     registerWorker();
 
@@ -592,6 +596,7 @@ DL.ui = (function () {
   function applyProfile(p) {
     if (el.deviceNote) el.deviceNote.textContent = p.describe();
     if (el.qr) { el.qr.style.width = `${p.qrPixels}px`; el.qr.style.height = `${p.qrPixels}px`; }
+    applyPrefs();   // the profile just wrote the same attributes; choices win
   }
 
   /* ── verification ── */
@@ -623,30 +628,130 @@ DL.ui = (function () {
     el.linkQuality.dataset.relayed = String(link.relayed);
   }
 
-  /* ── theme ── */
+  /* ── preferences ──
+     Stored as one object so a private-mode failure to persist degrades to
+     "settings work but are forgotten", never to a broken page. */
 
-  const THEMES = ['system', 'light', 'dark'];
+  const PREF_KEY = 'dropline-prefs';
+  const DEFAULTS = { theme: 'system', motion: 'auto', perf: 'auto', autoAccept: false, laufey: false };
+  let prefs = { ...DEFAULTS };
 
-  function applyStoredTheme() {
-    let saved = 'system';
-    try { saved = localStorage.getItem('dropline-theme') || 'system'; } catch { /* private mode */ }
-    setTheme(THEMES.includes(saved) ? saved : 'system', false);
+  function loadPrefs() {
+    try {
+      const raw = localStorage.getItem(PREF_KEY);
+      if (raw) prefs = { ...DEFAULTS, ...JSON.parse(raw) };
+    } catch { /* private mode, or corrupted -- defaults are fine */ }
   }
 
-  function setTheme(name, save) {
-    document.documentElement.dataset.theme = name;
-    if (el.themeBtn) {
-      el.themeBtn.textContent = name === 'system' ? 'Theme: auto' : `Theme: ${name}`;
-      el.themeBtn.setAttribute('aria-label', `Theme: ${name}. Click to change.`);
-    }
-    if (save !== false) {
-      try { localStorage.setItem('dropline-theme', name); } catch { /* private mode */ }
-    }
+  function savePrefs() {
+    try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch { /* ignore */ }
   }
 
-  function cycleTheme() {
-    const current = document.documentElement.dataset.theme || 'system';
-    setTheme(THEMES[(THEMES.indexOf(current) + 1) % THEMES.length], true);
+  // Re-asserted after every device recompute, because the profile owns those
+  // same attributes and would otherwise overwrite a deliberate choice.
+  function applyPrefs() {
+    const root = document.documentElement;
+    root.dataset.theme = prefs.theme;
+    if (prefs.motion !== 'auto') root.dataset.motion = prefs.motion;
+    if (prefs.perf === 'minimal') root.dataset.tier = 'minimal';
+
+    autoAccept = prefs.autoAccept;
+    if (el.prefAutoaccept) el.prefAutoaccept.checked = prefs.autoAccept;
+    if (el.autoAccept) el.autoAccept.checked = prefs.autoAccept;
+    if (el.laufeyChoice) el.laufeyChoice.hidden = !prefs.laufey;
+
+    check(el.prefTheme, 'theme', prefs.theme);
+    check(el.prefMotion, 'motion', prefs.motion);
+    check(el.prefPerf, 'perf', prefs.perf);
+  }
+
+  function check(group, name, value) {
+    if (!group) return;
+    const input = group.querySelector(`input[name="${name}"][value="${value}"]`);
+    if (input) input.checked = true;
+  }
+
+  function wirePrefs() {
+    if (!el.settings) return;
+
+    el.settingsBtn.addEventListener('click', () => {
+      if (el.prefDetected) {
+        const p = DL.device.profile;
+        const measured = p.signals.throughput;
+        el.prefDetected.textContent =
+          `Detected: ${p.describe()} · ${p.stripes} channel${p.stripes > 1 ? 's' : ''}` +
+          (measured ? ` · ${Math.round(measured)} MB/s measured` : '');
+      }
+      el.settings.showModal();
+    });
+
+    const onChoice = (group, name, key) => {
+      if (!group) return;
+      group.addEventListener('change', (e) => {
+        if (e.target.name !== name) return;
+        prefs[key] = e.target.value;
+        savePrefs();
+        if (key === 'motion' && prefs.motion === 'auto') DL.device.recompute();
+        if (key === 'perf' && prefs.perf === 'auto') DL.device.recompute();
+        applyPrefs();
+        announce(`${name} set to ${e.target.value}`);
+      });
+    };
+
+    onChoice(el.prefTheme, 'theme', 'theme');
+    onChoice(el.prefMotion, 'motion', 'motion');
+    onChoice(el.prefPerf, 'perf', 'perf');
+
+    el.prefAutoaccept.addEventListener('change', () => {
+      prefs.autoAccept = el.prefAutoaccept.checked;
+      savePrefs();
+      applyPrefs();
+    });
+
+    // Clicking outside the sheet closes it, which <dialog> does not do alone.
+    el.settings.addEventListener('click', (e) => {
+      if (e.target === el.settings) el.settings.close();
+    });
+  }
+
+  /* ── easter egg ──
+     Type the word anywhere to unlock a theme that is not otherwise listed. */
+
+  function wireEasterEgg() {
+    const word = 'laufey';
+    let progress = 0;
+    window.addEventListener('keydown', (e) => {
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (e.key && e.key.toLowerCase() === word[progress]) {
+        progress++;
+        if (progress === word.length) {
+          progress = 0;
+          unlockLaufey();
+        }
+      } else {
+        progress = e.key && e.key.toLowerCase() === word[0] ? 1 : 0;
+      }
+    });
+  }
+
+  function unlockLaufey() {
+    const first = !prefs.laufey;
+    prefs.laufey = true;
+    prefs.theme = 'laufey';
+    savePrefs();
+    applyPrefs();
+    announce(first ? 'Laufey theme unlocked' : 'Laufey theme');
+    if (first) flash('✦ laufey unlocked');
+  }
+
+  function flash(text) {
+    const note = document.createElement('div');
+    note.className = 'toast';
+    note.textContent = text;
+    document.body.append(note);
+    setTimeout(() => note.classList.add('out'), 2200);
+    setTimeout(() => note.remove(), 2800);
   }
 
   /* ── offline shell ──

@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <title>dropline</title>
 <meta name="description" content="Send files straight between two browsers. Nothing is uploaded, nothing is stored.">
-<link rel="stylesheet" href="style.3c1503eb30.css">
+<link rel="stylesheet" href="style.6adf29d9e7.css">
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#F0EEE6" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#171615" media="(prefers-color-scheme: dark)">
@@ -95,12 +95,57 @@
       <span id="device-note"></span>
     </span>
     <span class="foot-links">
-      <button id="theme-btn" type="button" class="foot-btn">Theme: auto</button>
+      <button id="settings-btn" type="button" class="foot-btn">Settings</button>
       <button id="install-btn" type="button" class="foot-btn" hidden>Install</button>
       <a href="updates.html">Updates</a>
       <a href="https://github.com/Aidiotic/dropline">Source</a>
     </span>
   </footer>
+
+  <dialog id="settings" class="sheet" aria-label="Settings">
+    <form method="dialog" class="sheet-body">
+      <div class="sheet-head">
+        <h2 class="sheet-title">Settings</h2>
+        <button value="close" class="sheet-close" aria-label="Close settings">esc</button>
+      </div>
+
+      <fieldset class="pref">
+        <legend>Theme</legend>
+        <div class="choices" id="pref-theme">
+          <label><input type="radio" name="theme" value="system" checked> Auto</label>
+          <label><input type="radio" name="theme" value="light"> Light</label>
+          <label><input type="radio" name="theme" value="dark"> Dark</label>
+          <label id="laufey-choice" hidden><input type="radio" name="theme" value="laufey"> Laufey</label>
+        </div>
+      </fieldset>
+
+      <fieldset class="pref">
+        <legend>Motion</legend>
+        <div class="choices" id="pref-motion">
+          <label><input type="radio" name="motion" value="auto" checked> Auto</label>
+          <label><input type="radio" name="motion" value="full"> Full</label>
+          <label><input type="radio" name="motion" value="none"> Off</label>
+        </div>
+      </fieldset>
+
+      <fieldset class="pref">
+        <legend>Performance</legend>
+        <div class="choices" id="pref-perf">
+          <label><input type="radio" name="perf" value="auto" checked> Auto</label>
+          <label><input type="radio" name="perf" value="minimal"> Lightweight</label>
+        </div>
+        <p class="pref-note" id="pref-detected"></p>
+      </fieldset>
+
+      <fieldset class="pref">
+        <legend>Transfers</legend>
+        <label class="switch">
+          <input type="checkbox" id="pref-autoaccept"> Accept incoming automatically
+        </label>
+        <p class="pref-note">Skips the prompt. Files are saved wherever your browser puts downloads.</p>
+      </fieldset>
+    </form>
+  </dialog>
 </main>
 
 <!-- Full-page drag target: dropping anywhere should work, not just the box. -->
@@ -113,6 +158,6 @@
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"
         integrity="sha384-lQXOAyZwHXE55JFyrOMB7nY2Wv+m5ZWNtJcHrd1rceRQXAYNLak8ukN5TjBTcIwz"
         crossorigin="anonymous"></script>
-<script src="dropline.1a4b8a3561.js"></script>
+<script src="dropline.98ff5888d5.js"></script>
 </body>
 </html>
