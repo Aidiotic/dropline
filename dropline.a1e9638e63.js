@@ -1675,7 +1675,11 @@ DL.session = (function () {
           case P.T.RESUME: {
             const item = incoming && incoming.items.find((i) => i.id === msg.itemId);
             const at = item && item.state === 'paused' ? item.done : 0;
-            note('resume-at', { item: msg.itemId, at });
+            note('resume-at', {
+              item: msg.itemId, at,
+              found: !!item, itemState: item ? item.state : null,
+              hasBatch: !!incoming,
+            });
             send(P.resumeAt(msg.itemId, at, item ? DL.util.crcFinal(item.crc) : 0));
             break;
           }
@@ -1997,16 +2001,24 @@ DL.session = (function () {
         });
       }
 
-      function drop() {
+      // Close the connection but keep the link, so the device can come back
+      // and pick up whatever it was part-way through. This is what a real
+      // network drop looks like from here.
+      function disconnect() {
         try { if (conn) conn.close(); } catch { /* already gone */ }
+      }
+
+      // Final: the device is not coming back and its state goes with it.
+      function drop() {
+        disconnect();
         conn = null;
         links.delete(link.id);
         announceTopology();
       }
 
       Object.assign(link, {
-        attach, adoptFrom, enqueue, acceptOffer, declineOffer, describeLink, drop,
-        live, takeConn,
+        attach, adoptFrom, enqueue, acceptOffer, declineOffer, describeLink,
+        drop, disconnect, live, takeConn,
       });
 
       // Defined rather than assigned: Object.assign evaluates a getter and
@@ -2085,7 +2097,8 @@ DL.session = (function () {
       // answering "what is it actually connected to" without a redeploy.
       get links() {
         return [...links.values()].map((l) => ({
-          id: l.id, label: l.label, live: l.live(), authed: l.authed, drop: l.drop,
+          id: l.id, label: l.label, live: l.live(), authed: l.authed,
+          drop: l.drop, disconnect: l.disconnect,
         }));
       },
       describeLink() {
