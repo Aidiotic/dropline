@@ -36,15 +36,28 @@ DL.ui = (function () {
 
   /* ── views and state ── */
 
+  let currentView = null;
+  let transitioning = false;
+
   function show(name) {
+    if (name === currentView) return;
+    currentView = name;
+
     const swap = () => {
       el.viewInvite.hidden = name !== 'invite';
       el.viewSession.hidden = name !== 'session';
       el.viewError.hidden = name !== 'error';
     };
-    // View Transitions where available; a plain swap everywhere else.
-    if (document.startViewTransition && !prefersReducedMotion()) {
-      document.startViewTransition(swap);
+
+    // View Transitions where available; a plain swap everywhere else. Starting
+    // a second transition while one is running aborts it, and the aborted
+    // promises reject — so never overlap them, and never leave them unhandled.
+    if (document.startViewTransition && !prefersReducedMotion() && !transitioning) {
+      transitioning = true;
+      const vt = document.startViewTransition(swap);
+      vt.finished.catch(() => {}).finally(() => { transitioning = false; });
+      vt.ready.catch(() => {});
+      vt.updateCallbackDone.catch(() => {});
     } else {
       swap();
     }
