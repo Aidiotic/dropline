@@ -897,9 +897,15 @@ DL.session = (function () {
         attach, adoptFrom, enqueue, acceptOffer, declineOffer, describeLink, drop,
         live,
         takeConn() { const c = conn; conn = null; return c; },
-        get authed() { return authed; },
-        get helloSeen() { return helloSeen; },
-        get hasOffer() { return !!offer; },
+      });
+
+      // Defined rather than assigned: Object.assign evaluates a getter and
+      // copies the value it returned, which would freeze these at whatever
+      // they were when the link was built.
+      Object.defineProperties(link, {
+        authed: { get: () => authed, enumerable: true },
+        helloSeen: { get: () => helloSeen, enumerable: true },
+        hasOffer: { get: () => !!offer, enumerable: true },
       });
       return link;
     }
