@@ -101,3 +101,4 @@ code against fresh markup.
 | `index.html` | Markup for all four panels (pick / share / receive / error) |
 | `style.css` | Flat cream-and-ink theme, light and dark |
 | `app.js` | Peer setup, the streaming pipelines, QR rendering |
+| `updates.html` | Release log and roadmap, served at `/updates.html` |
