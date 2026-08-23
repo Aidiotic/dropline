@@ -327,11 +327,15 @@ DL.session = (function () {
       // One side creates the channels and the other adopts them; both may then
       // send, since a data channel is duplex. Failure here is not fatal -- the
       // transfer simply runs on the control channel as before.
-      function setupStripes(c) {
+      // Both ends must stripe over the same number of channels: ordering is
+      // rebuilt from "chunk i went to channel i mod N", so if the sender uses
+      // four and the receiver listens on three, everything on the fourth is
+      // silently lost. Each side proposes a count in hello and both take the
+      // lower of the two, which is deterministic without another round trip.
+      function setupStripes(c, count) {
         const pc = c.peerConnection;
-        if (!pc) return;
+        if (!pc || !count) return;
         shieldPeerJs(c);
-        const count = DL.stripe.countFor();
 
         const attachChannels = (channels) => {
           if (!channels) return;
@@ -403,8 +407,6 @@ DL.session = (function () {
             c.send(P.auth(myNonce));
             emit('code', await shortCode(secret));
           }
-
-          setupStripes(c);
 
           flushOutbox();
           emit('status', 'connected');
@@ -532,11 +534,17 @@ DL.session = (function () {
         note('rx', { type: msg.t, link: link.id });
 
         switch (msg.t) {
-          case P.T.HELLO:
+          case P.T.HELLO: {
             helloSeen = true;
             rekey(link, msg.client);
+            const mine = DL.stripe.countFor();
+            const theirs = Math.max(1, Number(msg.stripes) || 1);
+            const agreed = Math.min(mine, theirs);
+            note('stripes', { mine, theirs, agreed });
+            if (conn) setupStripes(conn, agreed);
             emit('peer', { name: msg.name, version: msg.v, from: link.id });
             break;
+          }
 
           case P.T.AUTH:
             if (secret && typeof msg.nonce === 'string') {
