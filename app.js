@@ -542,8 +542,11 @@ async function receiveInto(conn, meta, handle, exposeSink, flow) {
   els.recvFill.style.width = '100%';
   els.recvFill.classList.add('done');
   els.recvStatus.textContent = {
+    // Only the FSA path writes the file itself, so only it can claim "saved".
+    // The worker path hands the bytes to the browser, which owns the write and
+    // may still refuse it — don't report a certainty we don't have.
     disk: `Saved ${bytes(meta.size)} to disk · ${rate}`,
-    download: `Saved ${bytes(meta.size)} to your downloads · ${rate}`,
+    download: `${bytes(meta.size)} sent to your browser's downloads · ${rate}`,
     memory: `${bytes(meta.size)} received · ${rate}`,
   }[how];
 }
