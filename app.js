@@ -44,6 +44,9 @@ if (HAS_SW) {
     .catch(() => null);
 }
 
+const RECV_WATERMARK = 4 * 1024 * 1024; // queued-but-unwritten bytes before we
+                                        // tell the sender to hold off
+
 const $ = (id) => document.getElementById(id);
 
 const els = {
@@ -173,6 +176,23 @@ function startSharing(file) {
 
   const id = newId();
   let claimed = false;
+
+  // bufferedAmount only describes our own send queue. It says nothing about
+  // whether the far end can write to disk as fast as we transmit, so the
+  // receiver drives this gate directly.
+  const flow = {
+    held: false,
+    waiter: null,
+    hold() { this.held = true; },
+    release() {
+      this.held = false;
+      if (this.waiter) { const w = this.waiter; this.waiter = null; w(); }
+    },
+    async wait() {
+      while (this.held) await new Promise((resolve) => { this.waiter = resolve; });
+    },
+  };
+
   peer = new Peer(id, SIGNAL);
 
   peer.on('open', () => {
@@ -200,14 +220,17 @@ function startSharing(file) {
 
     conn.on('data', (data) => {
       if (typeof data !== 'string') return;
-      if (JSON.parse(data).kind === 'ready') streamOut(conn, file, gzip);
+      const msg = JSON.parse(data);
+      if (msg.kind === 'ready') streamOut(conn, file, gzip, flow);
+      else if (msg.kind === 'hold') flow.hold();
+      else if (msg.kind === 'go') flow.release();
     });
 
     conn.on('error', () => fail('The connection dropped mid-transfer.'));
   });
 }
 
-async function streamOut(conn, file, gzip) {
+async function streamOut(conn, file, gzip, flow) {
   els.shareHandoff.hidden = true;
   els.shareProgress.hidden = false;
 
@@ -236,6 +259,7 @@ async function streamOut(conn, file, gzip) {
   let pending = new Uint8Array(0);
 
   const push = async (view) => {
+    await flow.wait(); // receiver is behind on writing; don't pile more on
     if (channel && channel.bufferedAmount > highWater) await drain(channel, highWater >> 1);
     if (!conn.open) throw new Error('closed');
     conn.send(view.slice().buffer); // copy: the view aliases a reused buffer
@@ -383,6 +407,7 @@ function startReceiving(hostId) {
     const conn = peer.connect(hostId, { reliable: true });
     let meta = null;
     let sink = null; // ReadableStream controller, once the user has accepted
+    const flow = { held: false, sink: null };
 
     // Messages are handled through a promise chain, never concurrently:
     // converting a Blob is async, and two overlapping handlers would enqueue
@@ -406,7 +431,15 @@ function startReceiving(hostId) {
       }
       if (!sink) return; // bytes before accept shouldn't happen, but don't crash
       const view = await toBytes(data);
-      if (view && sink) sink.enqueue(view);
+      if (!view || !sink) return;
+      sink.enqueue(view);
+
+      // desiredSize goes negative once more is queued than the destination has
+      // taken. Stop the sender rather than letting the backlog grow in memory.
+      if (!flow.held && sink.desiredSize !== null && sink.desiredSize <= 0) {
+        flow.held = true;
+        conn.send(JSON.stringify({ kind: 'hold' }));
+      }
     }
 
     conn.on('data', (data) => {
@@ -431,16 +464,20 @@ function startReceiving(hostId) {
 
       els.acceptBtn.hidden = true;
       els.recvProgress.hidden = false;
-      await receiveInto(conn, meta, handle, (c) => { sink = c; });
+      await receiveInto(conn, meta, handle, (c) => { sink = c; flow.sink = c; }, flow);
     };
   });
 }
 
-async function receiveInto(conn, meta, handle, exposeSink) {
+async function receiveInto(conn, meta, handle, exposeSink, flow) {
   let t0 = performance.now();
   let got = 0;
 
-  const incoming = new ReadableStream({ start: exposeSink });
+  // Counted in bytes, not chunks, so the watermark means something concrete.
+  const incoming = new ReadableStream(
+    { start: exposeSink },
+    new ByteLengthQueuingStrategy({ highWaterMark: RECV_WATERMARK }),
+  );
 
   const tick = throttle(() => {
     const pct = (got / meta.size) * 100;
@@ -451,7 +488,15 @@ async function receiveInto(conn, meta, handle, exposeSink) {
 
   let stream = incoming;
   if (meta.gzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
-  stream = stream.pipeThrough(meter((n) => { got += n; tick(); }));
+  stream = stream.pipeThrough(meter((n) => {
+    got += n;
+    tick();
+    // The queue has drained enough to take more; let the sender go again.
+    if (flow.held && flow.sink && flow.sink.desiredSize > 0) {
+      flow.held = false;
+      conn.send(JSON.stringify({ kind: 'go' }));
+    }
+  }));
 
   // Three ways to land the bytes, best first. Only the last one holds the
   // whole file in memory, and it is reached only if the other two are absent.
