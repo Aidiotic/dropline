@@ -1248,6 +1248,13 @@ DL.session = (function () {
     // A connection arriving from a client we already know is that client
     // reconnecting; reuse its link so partly-transferred files survive.
     function adopt(conn) {
+      // A guest only ever talks to one host, so a redial must reuse the link
+      // it already has -- building a fresh one would throw away the partly
+      // received batch that resume exists to rescue.
+      if (!isHost) {
+        const existing = links.values().next().value;
+        if (existing) { existing.attach(conn); return; }
+      }
       const link = createLink(conn);
       links.set(link.id, link);
       link.attach(conn);
@@ -2019,6 +2026,13 @@ DL.session = (function () {
       get authenticated() { return activeLinks().some((l) => l.authed); },
       get connected() { return activeLinks().some((l) => l.helloSeen); },
       get trace() { return trace.slice(); },
+      // Read-only view of the attached devices, for the interface and for
+      // answering "what is it actually connected to" without a redeploy.
+      get links() {
+        return [...links.values()].map((l) => ({
+          id: l.id, label: l.label, live: l.live(), authed: l.authed, drop: l.drop,
+        }));
+      },
       describeLink() {
         const first = activeLinks()[0];
         return first ? first.describeLink() : Promise.resolve(null);
