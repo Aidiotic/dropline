@@ -34,7 +34,7 @@ Nothing here is buffered whole. The file is a stream from end to end:
 
 ```
 sender     File.stream() → [gzip] → re-chunk → data channel
-receiver   data channel → [gunzip] → FileSystemWritableFileStream → disk
+receiver   data channel → [gunzip] → disk, or sealed Blobs → download
 ```
 
 Three things do the work:
@@ -48,23 +48,34 @@ Three things do the work:
   in a fraction of their real size. Formats that are already compressed —
   images, video, audio, archives — skip this, because running them through gzip
   costs CPU and saves nothing.
-- **The receiver writes straight to disk** through the File System Access API,
-  so memory stays flat no matter how large the file is. This is why receiving
-  takes an explicit click: `showSaveFilePicker()` requires a user gesture.
+- **The receiver never holds the file in the heap.** Where the File System
+  Access API exists it writes straight to disk, which is why receiving takes an
+  explicit click — `showSaveFilePicker()` requires a user gesture. Everywhere
+  else, chunks are sealed into Blobs every few megabytes; Blob bytes live
+  outside the JS heap and the browser spills them to disk, so memory stays flat
+  there too. The seal interval follows `navigator.deviceMemory`, 2 MB to 8 MB.
 
-Sending applies backpressure from `bufferedAmount`, so a fast disk can't outrun
-a slow network, and progress repaints are throttled to ~15/second — at
-100 MB/s a chunk lands every few milliseconds, and repainting on each one is
-itself enough to slow the transfer down.
+Two layers of backpressure, and both are needed. `bufferedAmount` stops a fast
+disk outrunning a slow network, but it only describes the *sender's* own queue —
+it cannot see a receiver that is slower at writing than the channel is at
+delivering. So the receiver also queues by byte length against a 4 MB watermark
+and sends hold/go back over the data channel. Without that second layer a 64 MB
+transfer grew the receiver's heap by 118 MB; with it, the steady state sits
+around 15 MB regardless of file size.
 
-Firefox and Safari have no File System Access API, so they fall back to
-assembling a Blob in memory and offering a download link. That path still
-streams and still decompresses; it just holds the result in RAM, which caps
-practical file size a couple of GB below.
+Progress repaints are throttled to ~15/second — at 100 MB/s a chunk lands every
+few milliseconds, and repainting on each one is itself enough to slow the
+transfer down.
+
+An earlier version streamed the non-FSA path through a service worker instead.
+It was dropped: browsers treat the synthetic download it produced with
+suspicion — Chrome was observed silently refusing them — whereas a sealed Blob
+is offered as an ordinary link the user clicks, which is a trusted gesture.
+The sealing approach is taken from *Beam*, a LAN QR-transfer app.
 
 ## Running it locally
 
-Three static files, no build step:
+Four static files, no build step:
 
 ```bash
 npx serve .
