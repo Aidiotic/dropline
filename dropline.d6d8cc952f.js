@@ -290,8 +290,10 @@ DL.device = (function () {
     else if (s.effectiveType === '2g' || s.effectiveType === 'slow-2g') score -= 3;
 
     // The measured figure outranks the advertised one where they disagree.
+    // Thresholds are set against what this actually achieves in JavaScript --
+    // a few hundred MB/s is a healthy machine, not a slow one.
     if (s.throughput !== null) {
-      score += s.throughput >= 800 ? 2 : s.throughput >= 400 ? 1 : s.throughput >= 150 ? 0 : -2;
+      score += s.throughput >= 500 ? 2 : s.throughput >= 250 ? 1 : s.throughput >= 100 ? 0 : -2;
     }
 
     if (s.saveData) score -= 3;                        // an explicit request

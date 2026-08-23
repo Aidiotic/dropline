@@ -244,43 +244,43 @@ const sig = (over) => Object.assign({
   memory: 4, cores: 4, effectiveType: '4g', downlink: 10, rtt: 50,
   saveData: false, coarse: false, hover: true, reduceMotion: false,
   width: 1400, height: 900, landscape: true, dpr: 2,
-  battery: { level: null, charging: null }, throughput: 500,
+  battery: { level: null, charging: null }, throughput: 300,
 }, over);
 
 group('device.tier');
 test('a capable machine on a fast link is high', () => {
-  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 8, throughput: 900 })), 'high');
+  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 8, throughput: 600 })), 'high');
 });
 test('a workstation reaches the top tier', () => {
-  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 24, throughput: 1200 })), 'ultra');
+  assert.strictEqual(device._tierFor(sig({ memory: 8, cores: 24, throughput: 700 })), 'ultra');
 });
 test('a 2 GB dual-core on 3G lands at the bottom', () => {
   assert.strictEqual(
-    device._tierFor(sig({ memory: 2, cores: 2, effectiveType: '3g', throughput: 90 })), 'minimal');
+    device._tierFor(sig({ memory: 2, cores: 2, effectiveType: '3g', throughput: 60 })), 'minimal');
 });
 test('a weak machine on a slow link is low or below', () => {
-  const t = device._tierFor(sig({ memory: 2, cores: 2, effectiveType: '2g', throughput: 200 }));
+  const t = device._tierFor(sig({ memory: 2, cores: 2, effectiveType: '2g', throughput: 150 }));
   assert.ok(t === 'low' || t === 'minimal', `expected low/minimal, got ${t}`);
 });
 test('a measured slow machine is demoted despite good spec sheet numbers', () => {
-  const claimed = device._tierFor(sig({ memory: 8, cores: 8, throughput: 900 }));
+  const claimed = device._tierFor(sig({ memory: 8, cores: 8, throughput: 600 }));
   const measured = device._tierFor(sig({ memory: 8, cores: 8, throughput: 80 }));
   assert.strictEqual(claimed, 'high');
   assert.ok(['mid', 'low'].includes(measured), `expected demotion, got ${measured}`);
 });
 test('save-data alone drops the tier, whatever the hardware', () => {
   const order = ['minimal', 'low', 'mid', 'high', 'ultra'];
-  const full = device._tierFor(sig({ memory: 8, cores: 8, throughput: 900 }));
+  const full = device._tierFor(sig({ memory: 8, cores: 8, throughput: 600 }));
   const saving = device._tierFor(sig({ memory: 8, cores: 8, throughput: 900, saveData: true }));
   assert.ok(order.indexOf(saving) < order.indexOf(full), `expected a demotion, got ${saving}`);
 });
 test('a mid-range machine is not flattered into the top tier', () => {
-  assert.strictEqual(device._tierFor(sig({ memory: 4, cores: 4, throughput: 500 })), 'mid');
+  assert.strictEqual(device._tierFor(sig({ memory: 4, cores: 4, throughput: 300 })), 'mid');
 });
 test('a draining battery pushes a borderline device down a tier', () => {
   // Penalises the score rather than overriding it: plenty of headroom absorbs
   // it, a marginal device does not.
-  const marginal = sig({ memory: 4, cores: 2, throughput: 300 });
+  const marginal = sig({ memory: 4, cores: 2, throughput: 200 });
   const rested = device._tierFor(marginal);
   const draining = device._tierFor({ ...marginal, battery: { level: 0.1, charging: false } });
   const order = ['minimal', 'low', 'mid', 'high', 'ultra'];
@@ -288,12 +288,12 @@ test('a draining battery pushes a borderline device down a tier', () => {
     `expected a demotion, got ${rested} -> ${draining}`);
 });
 test('a draining battery cuts motion even on capable hardware', () => {
-  const flat = sig({ memory: 8, cores: 8, throughput: 900, battery: { level: 0.1, charging: false } });
+  const flat = sig({ memory: 8, cores: 8, throughput: 600, battery: { level: 0.1, charging: false } });
   assert.strictEqual(device._tierFor(flat), 'mid', 'capable hardware steps down');
   assert.strictEqual(device._motionFor(flat, 'high'), 'minimal', 'and stops animating');
 });
 test('charging removes the battery penalty entirely', () => {
-  const charging = sig({ memory: 8, cores: 8, throughput: 900, battery: { level: 0.1, charging: true } });
+  const charging = sig({ memory: 8, cores: 8, throughput: 600, battery: { level: 0.1, charging: true } });
   assert.strictEqual(device._tierFor(charging), 'high');
   assert.strictEqual(device._motionFor(charging, 'high'), 'full');
 });
