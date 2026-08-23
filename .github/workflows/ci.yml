@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Unit tests
+        run: npm test
+
+      # Assets are content-hashed and committed. If src/ changed without a
+      # rebuild, the deployed site would serve stale code — fail loudly here
+      # rather than discovering it in the browser.
+      - name: Committed build matches src/
+        run: npm run check

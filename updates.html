@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <title>dropline — update log</title>
 <meta name="description" content="Release notes and roadmap for dropline.">
-<link rel="stylesheet" href="style.css?v=8">
+<link rel="stylesheet" href="style.4b1cedf252.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='3' fill='%23D97757'/></svg>">
 </head>
 <body class="doc">
@@ -20,64 +20,55 @@
   <section class="panel">
     <h2 class="sect">Roadmap</h2>
     <p class="sect-note">
-      Ordered by how much each one actually hurts today. The first two are the
-      difference between a demo and something you'd rely on.
+      Ordered by how much each one actually hurts today. The top two are the
+      only things still standing between this and something you'd depend on —
+      and both are written and waiting on a deploy rather than on code.
     </p>
 
     <ol class="road">
       <li>
-        <h3>TURN relay <span class="tag tag-now">next</span></h3>
+        <h3>TURN relay <span class="tag tag-now">ready to deploy</span></h3>
         <p>
           Roughly 10–20% of network pairs — two symmetric NATs, or a strict
-          corporate firewall — cannot form a direct connection at all, and today
-          those transfers simply fail. A TURN relay is the only real fix. This
-          is the single biggest gap.
+          corporate firewall — cannot form a direct connection, and those
+          transfers fail outright. The client reads short-lived credentials from
+          a configurable endpoint, and a Cloudflare Worker that mints them ships
+          in <code>worker/turn-credentials.js</code>. It needs a Cloudflare
+          account and an API token to go live. Until then this remains the single
+          biggest gap.
         </p>
       </li>
       <li>
-        <h3>Self-hosted signalling <span class="tag tag-now">next</span></h3>
+        <h3>Self-hosted signalling <span class="tag tag-now">ready to deploy</span></h3>
         <p>
-          Introductions currently go through PeerJS's free public broker: a
-          shared service with no uptime guarantee, and the most likely thing to
-          break without warning. Moving it to a Worker removes the one
-          third-party dependency in the path.
+          Introductions still go through PeerJS's free public broker: a shared
+          service with no uptime guarantee, and the likeliest thing to break
+          without warning. Point <code>config.js</code> at your own PeerServer to
+          remove the last third-party dependency in the path.
         </p>
       </li>
       <li>
-        <h3>Multi-file and folders</h3>
+        <h3>Resume an interrupted transfer</h3>
         <p>
-          One file per link today; a folder means zipping it first. A queue,
-          with drag-and-drop and paste-a-screenshot, covers what people
-          actually want to send.
+          A dropped connection now recovers the session, but the file in flight
+          restarts from zero. Resuming from an offset needs the receiver to
+          report how much it committed to disk, which only works reliably on the
+          File System Access path.
         </p>
       </li>
       <li>
-        <h3>Reconnect after sleep</h3>
+        <h3>More than two devices</h3>
         <p>
-          If a phone locks or backgrounds the tab mid-transfer, the connection
-          dies and the whole file starts over. Rescanning the same code should
-          resume instead.
+          A session holds exactly one pair. Sending to a laptop and a phone at
+          once means two links.
         </p>
       </li>
       <li>
-        <h3>Send in both directions</h3>
+        <h3>Verify on real iOS and Firefox</h3>
         <p>
-          The sender is whoever opened the page first. Either side should be
-          able to send, with the same interface on both.
-        </p>
-      </li>
-      <li>
-        <h3>Text and link snippets</h3>
-        <p>
-          Sending a URL, a wifi password or a snippet of code shouldn't require
-          making a file first.
-        </p>
-      </li>
-      <li>
-        <h3>Accessibility pass</h3>
-        <p>
-          Focus rings and keyboard access exist; live-region announcements and
-          progress bars that expose <code>aria-valuenow</code> do not.
+          Every automated check runs in one Chromium browser. The fallbacks for
+          Safari and Firefox are exercised by simulating a missing API, which is
+          not the same as running there.
         </p>
       </li>
     </ol>
@@ -85,6 +76,52 @@
 
   <section class="panel">
     <h2 class="sect">Releases</h2>
+
+    <article class="rel">
+      <h3>v1.0 <time datetime="2026-08-23">23 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>Both devices can send.</strong> A session is now symmetric
+          rather than one sender and one receiver — either side can push files
+          at any time, with the same interface on both.
+        </li>
+        <li>
+          <strong>Multiple files and whole folders.</strong> Drag a folder in,
+          pick several files, or paste a screenshot straight into the page.
+          Folder structure is rebuilt on the far side; every path segment is
+          sanitised on both ends so a sender cannot write outside the directory
+          you chose.
+        </li>
+        <li>
+          <strong>Text and link snippets</strong> without making a file first,
+          with one-tap copy at the other end.
+        </li>
+        <li>
+          <strong>Reconnects instead of dying.</strong> A dropped connection
+          retries with backoff, and the session survives a phone locking or a
+          tab being backgrounded. The file that was in flight restarts.
+        </li>
+        <li>
+          <strong>Accessibility pass.</strong> Live-region announcements for
+          state changes, progress bars exposing <code>aria-valuenow</code>,
+          keyboard-reachable drop zone, and touch targets that stay comfortable
+          on a phone.
+        </li>
+        <li>
+          <strong>Assets are content-hashed.</strong> Filenames change when the
+          contents change, so the ten-minute Pages cache can no longer serve
+          stale code — and nobody has to remember to bump a version.
+        </li>
+        <li>
+          <strong>42 unit tests</strong> over the pure logic, run in CI along
+          with a check that the committed build matches <code>src/</code>.
+        </li>
+        <li>
+          Configurable ICE servers, TURN endpoint and signalling host via
+          <code>config.js</code>.
+        </li>
+      </ul>
+    </article>
 
     <article class="rel">
       <h3>v0.9 <time datetime="2026-08-23">23 Aug 2026</time></h3>
@@ -100,7 +137,6 @@
           Seal interval adapts to <code>navigator.deviceMemory</code>: 2 MB on
           low-memory devices, 8 MB on capable ones.
         </li>
-        <li>Any previously registered service worker is now unregistered on load.</li>
       </ul>
       <p class="credit">
         This approach is lifted from <em>Beam</em>, a LAN QR-transfer app, which
@@ -162,9 +198,8 @@
           button was visible before anything had been received.
         </li>
         <li>
-          Asset URLs are versioned. GitHub Pages serves files with a ten-minute
-          cache, so returning visitors were running stale code against fresh
-          markup.
+          Asset URLs versioned, so returning visitors stopped running stale code
+          against fresh markup. Replaced by content hashing in v1.0.
         </li>
       </ul>
     </article>
@@ -199,8 +234,7 @@
         <li>
           The file is streamed rather than buffered, chunk size is negotiated
           from the connection's <code>maxMessageSize</code> instead of hard-coded
-          at 64 KB, and compressible files are gzipped in flight. Already-packed
-          formats skip compression.
+          at 64 KB, and compressible files are gzipped in flight.
         </li>
         <li>QR code, so a phone can scan the link instead of typing it.</li>
       </ul>

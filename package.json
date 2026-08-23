@@ -1,0 +1,14 @@
+{
+  "name": "dropline",
+  "version": "1.0.0",
+  "description": "Peer-to-peer file transfer between two browsers over WebRTC. No server holds the file.",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build": "node build.js",
+    "check": "node build.js --check",
+    "test": "node test.js",
+    "serve": "npx --yes serve .",
+    "verify": "npm test && npm run check"
+  }
+}

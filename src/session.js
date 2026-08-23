@@ -1,0 +1,456 @@
+/* Session: peer lifecycle, reconnection, message routing, and the send/receive
+   state machines. Symmetric — either peer may offer a batch at any time. */
+
+var DL = (typeof DL !== 'undefined') ? DL : {};
+
+DL.session = (function () {
+  const P = DL.protocol;
+  const ID_PREFIX = 'dropline-';
+  const RECV_WATERMARK = 4 * 1024 * 1024;
+  const RETRY_DELAYS = [800, 1600, 3200, 6000, 10000];
+
+  const DEFAULT_ICE = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ];
+
+  // TURN credentials, if configured, are short-lived and fetched at runtime so
+  // nothing long-lived is baked into a public static file.
+  async function iceServers() {
+    const cfg = (typeof window !== 'undefined' && window.DROPLINE_CONFIG) || {};
+    const base = (cfg.iceServers && cfg.iceServers.length) ? cfg.iceServers.slice() : DEFAULT_ICE.slice();
+    if (!cfg.turnCredentialsUrl) return base;
+    try {
+      const res = await fetch(cfg.turnCredentialsUrl, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`turn endpoint ${res.status}`);
+      const data = await res.json();
+      const extra = data.iceServers || (data.urls ? [data] : []);
+      return base.concat(extra);
+    } catch (err) {
+      // A missing relay costs reliability, not correctness — carry on with STUN.
+      console.warn('dropline: TURN unavailable, continuing without a relay', err);
+      return base;
+    }
+  }
+
+  function peerOptions(ice) {
+    const cfg = (typeof window !== 'undefined' && window.DROPLINE_CONFIG) || {};
+    const opts = { debug: 1, config: { iceServers: ice } };
+    if (cfg.peerServer) Object.assign(opts, cfg.peerServer);
+    return opts;
+  }
+
+  function newSessionId() {
+    return DL.util.newId(ID_PREFIX, (n) => crypto.getRandomValues(new Uint8Array(n)));
+  }
+
+  function create(options) {
+    const on = options.on || {};
+    const isHost = options.role === 'host';
+    const hostId = isHost ? newSessionId() : options.hostId;
+
+    let peer = null;
+    let conn = null;
+    let closed = false;
+    let retry = 0;
+    let helloSeen = false;
+
+    // Outbound gate, driven by the far end's hold/go.
+    const gate = {
+      held: false,
+      waiter: null,
+      hold() { this.held = true; },
+      release() {
+        this.held = false;
+        if (this.waiter) { const w = this.waiter; this.waiter = null; w(); }
+      },
+      async wait() {
+        while (this.held && !closed) {
+          await new Promise((resolve) => { this.waiter = resolve; });
+        }
+      },
+    };
+
+    // Inbound backpressure bookkeeping.
+    const inbound = { held: false, sink: null };
+
+    const outQueue = [];
+    let sending = false;
+
+    let offer = null;   // batch awaiting the user's decision
+    let incoming = null; // batch being received
+
+    const emit = (name, ...args) => { if (on[name]) on[name](...args); };
+    const live = () => !!conn && conn.open && !closed;
+
+    /* ── connection lifecycle ── */
+
+    async function start() {
+      const ice = await iceServers();
+      if (closed) return;
+
+      peer = isHost ? new Peer(hostId, peerOptions(ice)) : new Peer(peerOptions(ice));
+
+      peer.on('open', () => {
+        if (isHost) {
+          emit('link', `${location.origin}${location.pathname}#${hostId}`, hostId);
+          emit('status', 'waiting');
+        } else {
+          dial();
+        }
+      });
+
+      peer.on('connection', (incomingConn) => {
+        if (!isHost) return;
+        if (conn && conn.open) { incomingConn.on('open', () => incomingConn.close()); return; }
+        adopt(incomingConn);
+      });
+
+      peer.on('disconnected', () => {
+        if (closed) return;
+        emit('status', 'reconnecting');
+        try { peer.reconnect(); } catch { /* destroyed underneath us */ }
+      });
+
+      peer.on('error', (err) => {
+        if (closed) return;
+        const type = err && err.type;
+        if (type === 'unavailable-id' && isHost) { emit('error', 'That session id is taken. Reload to get a new one.'); return; }
+        if (type === 'peer-unavailable') { scheduleRetry(); return; }
+        if (type === 'network' || type === 'socket-error' || type === 'server-error') { scheduleRetry(); return; }
+        emit('error', `Connection problem (${type || 'unknown'}).`);
+      });
+    }
+
+    function dial() {
+      if (closed || !peer || peer.destroyed) return;
+      emit('status', retry ? 'reconnecting' : 'connecting');
+      adopt(peer.connect(hostId, { reliable: true }));
+    }
+
+    function scheduleRetry() {
+      if (closed || isHost) return;
+      if (retry >= RETRY_DELAYS.length) {
+        emit('status', 'failed');
+        emit('error', 'Could not reach the other device. They may have closed the tab.');
+        return;
+      }
+      const wait = RETRY_DELAYS[retry++];
+      emit('status', 'reconnecting', wait);
+      setTimeout(() => { if (!closed) dial(); }, wait);
+    }
+
+    function adopt(c) {
+      conn = c;
+      let chain = Promise.resolve();
+
+      c.on('open', () => {
+        retry = 0;
+        helloSeen = false;
+        gate.release();
+        c.send(P.hello(options.name || 'someone'));
+        emit('status', 'connected');
+        pump(); // anything queued while disconnected
+      });
+
+      // Serialised: converting a Blob is async, and overlapping handlers would
+      // enqueue chunks out of order and silently corrupt a file.
+      c.on('data', (data) => {
+        chain = chain.then(() => route(data)).catch((err) => {
+          emit('error', `Transfer failed: ${err && err.message ? err.message : err}`);
+        });
+      });
+
+      c.on('close', () => {
+        if (closed) return;
+        failActiveTransfers('The connection dropped.');
+        conn = null;
+        gate.release();
+        if (isHost) emit('status', 'waiting');
+        else scheduleRetry();
+      });
+
+      c.on('error', () => { /* close follows; handled there */ });
+    }
+
+    function failActiveTransfers(reason) {
+      if (incoming) {
+        try { incoming.sink && incoming.sink.error(new Error(reason)); } catch { /* already gone */ }
+        incoming.items.forEach((it) => {
+          if (it.state === 'active') emit('item', { ...it, state: 'failed', detail: reason });
+        });
+        incoming = null;
+      }
+      sending = false;
+    }
+
+    /* ── inbound ── */
+
+    async function route(raw) {
+      if (typeof raw !== 'string') {
+        if (!incoming || !incoming.sink) return;
+        const view = await DL.transfer.toBytes(raw);
+        if (!view) return;
+        incoming.sink.enqueue(view);
+        if (!inbound.held && incoming.sink.desiredSize !== null && incoming.sink.desiredSize <= 0) {
+          inbound.held = true;
+          send(P.hold());
+        }
+        return;
+      }
+
+      const msg = P.parse(raw);
+      if (!msg) return;
+
+      switch (msg.t) {
+        case P.T.HELLO:
+          helloSeen = true;
+          emit('peer', { name: msg.name, version: msg.v });
+          break;
+
+        case P.T.HOLD: gate.hold(); break;
+        case P.T.GO:   gate.release(); break;
+
+        case P.T.MANIFEST:
+          offer = {
+            batchId: msg.batchId,
+            items: msg.items.map((it) => ({ ...it, dir: 'in', state: 'offered', done: 0 })),
+          };
+          emit('offer', offer);
+          break;
+
+        case P.T.ACCEPT:
+          if (pendingOut && pendingOut.batchId === msg.batchId) {
+            pendingOut.resolve(true);
+            pendingOut = null;
+          }
+          break;
+
+        case P.T.DECLINE:
+          if (pendingOut && pendingOut.batchId === msg.batchId) {
+            pendingOut.resolve(false);
+            pendingOut = null;
+          }
+          break;
+
+        case P.T.TEXT: {
+          const item = incoming && incoming.items.find((i) => i.id === msg.itemId);
+          const name = item ? item.name : 'Text';
+          emit('item', { id: msg.itemId, dir: 'in', kind: 'text', name, body: msg.body, state: 'done', size: msg.body.length });
+          break;
+        }
+
+        case P.T.BEGIN: await beginItem(msg.itemId); break;
+        case P.T.END:   await endItem(msg.itemId); break;
+
+        case P.T.DONE:
+          if (incoming) { emit('batchDone', incoming); incoming = null; }
+          break;
+
+        case P.T.BYE:
+          emit('status', 'closed');
+          break;
+
+        default: break;
+      }
+    }
+
+    async function beginItem(itemId) {
+      if (!incoming) return;
+      const item = incoming.items.find((i) => i.id === itemId);
+      if (!item) return;
+
+      incoming.current = item;
+      item.state = 'active';
+      item.startedAt = Date.now();
+      emit('item', { ...item });
+
+      let sink = null;
+      const readable = new ReadableStream(
+        { start(c) { sink = c; } },
+        new ByteLengthQueuingStrategy({ highWaterMark: RECV_WATERMARK }),
+      );
+      incoming.sink = sink;
+      inbound.sink = sink;
+      inbound.held = false;
+
+      const tick = DL.util.throttle(() => emit('item', { ...item }), 70);
+
+      let stream = readable;
+      if (item.gzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
+      stream = stream.pipeThrough(DL.transfer.meter((n) => {
+        item.done += n;
+        tick();
+        if (inbound.held && inbound.sink && inbound.sink.desiredSize > 0) {
+          inbound.held = false;
+          send(P.go());
+        }
+      }));
+
+      let blob = null;
+      const dest = await DL.transfer.sinkFor(incoming.dest, item, (b) => { blob = b; });
+      incoming.pipe = stream.pipeTo(dest).then(() => {
+        item.state = 'done';
+        item.blob = blob;
+        item.elapsed = (Date.now() - item.startedAt) / 1000;
+        item.savedToDisk = incoming.dest.kind !== 'seal';
+        emit('item', { ...item });
+      });
+    }
+
+    async function endItem(itemId) {
+      if (!incoming || !incoming.sink) return;
+      try { incoming.sink.close(); } catch { /* already closed */ }
+      incoming.sink = null;
+      inbound.sink = null;
+      if (inbound.held) { inbound.held = false; send(P.go()); }
+      try { await incoming.pipe; } catch (err) {
+        const item = incoming.items.find((i) => i.id === itemId);
+        if (item) emit('item', { ...item, state: 'failed', detail: 'Could not write the file.' });
+      }
+    }
+
+    // Called from a click: the file pickers need a user gesture.
+    async function acceptOffer() {
+      if (!offer) return;
+      const files = offer.items.filter((i) => i.kind === 'file');
+      const dest = await DL.transfer.chooseDestination(files);
+      if (!dest) return; // cancelled — leave the offer standing
+      incoming = { ...offer, dest, sink: null, pipe: null };
+      offer = null;
+      send(P.accept(incoming.batchId));
+      emit('accepted', incoming);
+    }
+
+    function declineOffer() {
+      if (!offer) return;
+      send(P.decline(offer.batchId, 'declined'));
+      emit('declined', offer);
+      offer = null;
+    }
+
+    /* ── outbound ── */
+
+    let pendingOut = null;
+
+    function send(raw) { if (live()) conn.send(raw); }
+
+    function enqueue(entries) {
+      outQueue.push(entries);
+      pump();
+    }
+
+    async function pump() {
+      if (sending || !outQueue.length || !live()) return;
+      sending = true;
+      const entries = outQueue.shift();
+
+      try {
+        await sendBatch(entries);
+      } catch (err) {
+        emit('error', `Send failed: ${err && err.message ? err.message : err}`);
+        entries.forEach((e) => emit('item', {
+          id: e.tempId, dir: 'out', kind: e.kind, name: e.name, size: e.size,
+          state: 'failed', detail: 'Send failed.',
+        }));
+      } finally {
+        sending = false;
+        if (outQueue.length) pump();
+      }
+    }
+
+    async function sendBatch(entries) {
+      const batchId = `b${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+      const withGzip = entries.map((e) => ({
+        ...e,
+        gzip: e.kind === 'file' && DL.util.shouldCompress(e.mime, e.size, DL.transfer.HAS_GZIP),
+      }));
+      const { items, wire } = P.manifest(batchId, withGzip);
+
+      items.forEach((it) => emit('item', { ...it, dir: 'out', state: 'offered', done: 0 }));
+      send(wire);
+
+      const accepted = await new Promise((resolve) => {
+        pendingOut = { batchId, resolve };
+        setTimeout(() => {
+          if (pendingOut && pendingOut.batchId === batchId) { pendingOut = null; resolve(false); }
+        }, 120000);
+      });
+
+      if (!accepted) {
+        items.forEach((it) => emit('item', { ...it, dir: 'out', state: 'declined' }));
+        return;
+      }
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const entry = withGzip[i];
+        if (!live()) throw new Error('connection lost');
+
+        if (item.kind === 'text') {
+          send(P.text(item.id, entry.body));
+          emit('item', { ...item, dir: 'out', state: 'done', done: item.size, body: entry.body });
+          continue;
+        }
+
+        const started = Date.now();
+        emit('item', { ...item, dir: 'out', state: 'active', done: 0 });
+        const tick = DL.util.throttle(
+          (n) => emit('item', { ...item, dir: 'out', state: 'active', done: n }), 70);
+
+        send(P.begin(item.id));
+        const { wire: onWire } = await DL.transfer.pumpFile(conn, entry.file, {
+          gzip: entry.gzip,
+          flow: gate,
+          isLive: live,
+          onProgress: tick,
+        });
+        send(P.end(item.id));
+
+        emit('item', {
+          ...item, dir: 'out', state: 'done', done: item.size,
+          elapsed: (Date.now() - started) / 1000, wire: onWire,
+        });
+      }
+
+      send(P.done(batchId));
+      emit('batchSent', items);
+    }
+
+    /* ── public surface ── */
+
+    // Accepts either prepared entries (with a relative path) or bare Files.
+    function sendFiles(input) {
+      const entries = Array.from(input).map((e) => (e && e.file ? e : {
+        kind: 'file', file: e, name: e.name, size: e.size, mime: e.type, path: '',
+      }));
+      if (entries.length) enqueue(entries);
+      return entries.length;
+    }
+
+    function sendText(body) {
+      if (!body || !body.trim()) return 0;
+      const trimmed = body.slice(0, 100000);
+      enqueue([{ kind: 'text', body: trimmed, name: 'Text snippet', size: trimmed.length, mime: 'text/plain' }]);
+      return 1;
+    }
+
+    function close() {
+      closed = true;
+      try { send(P.bye()); } catch { /* connection already gone */ }
+      try { if (peer) peer.destroy(); } catch { /* already destroyed */ }
+      peer = null;
+      conn = null;
+    }
+
+    start();
+
+    return {
+      sendFiles, sendText, acceptOffer, declineOffer, close,
+      get hostId() { return hostId; },
+      get connected() { return live() && helloSeen; },
+    };
+  }
+
+  return { create, ID_PREFIX, newSessionId, DEFAULT_ICE };
+})();

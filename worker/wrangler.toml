@@ -1,0 +1,7 @@
+name = "dropline-turn"
+main = "turn-credentials.js"
+compatibility_date = "2026-01-01"
+
+# Secrets are set with `wrangler secret put`, never committed:
+#   wrangler secret put TURN_KEY_ID
+#   wrangler secret put TURN_API_TOKEN
