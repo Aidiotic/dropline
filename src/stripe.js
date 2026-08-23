@@ -82,6 +82,11 @@ DL.stripe = (function () {
     return {
       count: n,
       get sent() { return index; },
+      // The reader restarts its per-channel counts at every item, so the
+      // writer's round-robin position must restart too -- otherwise item two
+      // begins on whichever channel item one happened to end on, and the two
+      // sides disagree about which chunk is which.
+      reset() { index = 0; },
       async send(buffer) {
         const ch = channels[index % n];
         if (ch.readyState !== 'open') throw new Error('stripe closed');

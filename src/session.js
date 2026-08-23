@@ -690,6 +690,7 @@ DL.session = (function () {
           DL.device.profile.chunkCap,
         );
 
+        if (stripeWriter) stripeWriter.reset();   // per item, to match the reader
         const write = stripeWriter
           ? (buf) => stripeWriter.send(buf)
           : (buf) => { conn.send(buf); };
