@@ -18,6 +18,14 @@
 
 const TTL_SECONDS = 3600;
 
+const HINTS = {
+  404: 'No TURN key with that id. Create one under Realtime → TURN in the ' +
+       'Cloudflare dashboard, then: wrangler secret put TURN_KEY_ID. A real key ' +
+       'id is a long hex string — if you typed a placeholder, this is what you get.',
+  401: 'The API token was rejected. Re-run: wrangler secret put TURN_API_TOKEN',
+  403: 'The API token lacks permission for this TURN key.',
+};
+
 // Only these origins may request credentials. Anyone can still read the
 // response they are given, but this keeps other sites off your relay quota.
 const ALLOWED_ORIGINS = [
@@ -48,21 +56,32 @@ export default {
       return json({ error: 'worker is missing TURN_KEY_ID or TURN_API_TOKEN' }, 500, cors);
     }
 
-    const upstream = await fetch(
-      `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${env.TURN_API_TOKEN}`,
-          'Content-Type': 'application/json',
+    let upstream;
+    try {
+      upstream = await fetch(
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${env.TURN_API_TOKEN}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ ttl: TTL_SECONDS }),
+          signal: AbortSignal.timeout(5000),
         },
-        body: JSON.stringify({ ttl: TTL_SECONDS }),
-      },
-    );
+      );
+    } catch (err) {
+      return json({ error: 'could not reach the TURN provider', detail: String(err) }, 504, cors);
+    }
 
     if (!upstream.ok) {
-      // Don't leak the upstream body — it can contain account detail.
-      return json({ error: `turn provider returned ${upstream.status}` }, 502, cors);
+      // Never echo the upstream body — it can carry account detail. Say what
+      // is actually wrong instead, since "502" sends people hunting the wrong
+      // problem: the usual cause is a secret that was never really set.
+      return json({
+        error: `turn provider returned ${upstream.status}`,
+        hint: HINTS[upstream.status] || 'Check TURN_KEY_ID and TURN_API_TOKEN.',
+      }, 502, cors);
     }
 
     const data = await upstream.json();

@@ -72,8 +72,17 @@ DL.transfer = (function () {
 
     let read = 0;
     let wire = 0;
+    let crc = DL.util.crcInit();
 
-    let stream = file.stream().pipeThrough(meter((n) => { read += n; opts.onProgress(read); }));
+    // Checksummed before compression so both ends hash the same plaintext.
+    let stream = file.stream().pipeThrough(new TransformStream({
+      transform(chunk, ctrl) {
+        read += chunk.byteLength;
+        crc = DL.util.crcUpdate(crc, chunk);
+        opts.onProgress(read);
+        ctrl.enqueue(chunk);
+      },
+    }));
     if (opts.gzip) stream = stream.pipeThrough(new CompressionStream('gzip'));
 
     const reader = stream.getReader();
@@ -104,7 +113,7 @@ DL.transfer = (function () {
       reader.cancel().catch(() => {});
     }
 
-    return { read, wire };
+    return { read, wire, crc: DL.util.crcFinal(crc) };
   }
 
   function concat(a, b) {

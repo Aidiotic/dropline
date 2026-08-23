@@ -188,6 +188,53 @@ test('declines to guess without data', () => {
   assert.strictEqual(util.eta(0, 100, 5), null);
 });
 
+/* ── integrity ── */
+
+group('util.crc32');
+test('matches the standard check vector', () => {
+  // The canonical CRC-32 check value for "123456789".
+  const bytes = new Uint8Array([...'123456789'].map((c) => c.charCodeAt(0)));
+  assert.strictEqual(util.crc32(bytes) >>> 0, 0xCBF43926);
+});
+test('is empty-safe', () => {
+  assert.strictEqual(util.crc32(new Uint8Array(0)) >>> 0, 0);
+});
+test('incremental updates equal a single pass', () => {
+  const all = new Uint8Array([...'the quick brown fox'].map((c) => c.charCodeAt(0)));
+  let state = util.crcInit();
+  state = util.crcUpdate(state, all.subarray(0, 4));
+  state = util.crcUpdate(state, all.subarray(4, 11));
+  state = util.crcUpdate(state, all.subarray(11));
+  assert.strictEqual(util.crcFinal(state) >>> 0, util.crc32(all) >>> 0);
+});
+test('detects a reordered chunk, which is the bug it exists to catch', () => {
+  const a = new Uint8Array([1, 2, 3, 4]);
+  const b = new Uint8Array([3, 4, 1, 2]);
+  assert.notStrictEqual(util.crc32(a), util.crc32(b));
+});
+test('detects truncation', () => {
+  const full = new Uint8Array([9, 8, 7, 6, 5]);
+  assert.notStrictEqual(util.crc32(full), util.crc32(full.subarray(0, 4)));
+});
+test('stays an unsigned 32-bit value', () => {
+  const bytes = new Uint8Array([255, 255, 255, 255, 0, 1]);
+  const v = util.crc32(bytes);
+  assert.ok(v >= 0 && v <= 0xFFFFFFFF, `out of range: ${v}`);
+});
+
+group('util.ema');
+test('takes the first sample as-is', () => {
+  assert.strictEqual(util.ema(null, 100, 0.3), 100);
+  assert.strictEqual(util.ema(undefined, 42, 0.3), 42);
+});
+test('moves toward the new sample without jumping to it', () => {
+  const next = util.ema(100, 200, 0.5);
+  assert.strictEqual(next, 150);
+});
+test('recovers from a non-finite previous value', () => {
+  assert.strictEqual(util.ema(NaN, 7, 0.3), 7);
+});
+
 /* ── protocol ── */
 
 group('protocol.manifest');

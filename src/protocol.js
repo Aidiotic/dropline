@@ -46,7 +46,7 @@ DL.protocol = (function () {
   const accept  = (batchId) => JSON.stringify({ t: T.ACCEPT, batchId });
   const decline = (batchId, reason) => JSON.stringify({ t: T.DECLINE, batchId, reason });
   const begin   = (itemId) => JSON.stringify({ t: T.BEGIN, itemId });
-  const end     = (itemId) => JSON.stringify({ t: T.END, itemId });
+  const end     = (itemId, crc, bytes) => JSON.stringify({ t: T.END, itemId, crc, bytes });
   const done    = (batchId) => JSON.stringify({ t: T.DONE, batchId });
   const hold    = () => JSON.stringify({ t: T.HOLD });
   const go      = () => JSON.stringify({ t: T.GO });

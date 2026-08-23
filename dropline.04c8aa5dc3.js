@@ -103,6 +103,47 @@ DL.util = (function () {
     return parts.slice(0, 16); // absurdly deep trees are not worth honouring
   }
 
+  /* ── integrity ──
+     Web Crypto has no streaming digest, and hashing a file whole would put it
+     back in memory — the exact thing the streaming design avoids. CRC32 is
+     incremental, costs almost nothing, and catches what actually goes wrong
+     here: truncation, reordering, a dropped chunk. It is a corruption check,
+     not a tamper check, and is not relied on for security. */
+
+  const CRC_TABLE = (function () {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[i] = c >>> 0;
+    }
+    return table;
+  })();
+
+  const crcInit = () => 0xFFFFFFFF;
+
+  function crcUpdate(state, bytes) {
+    let c = state >>> 0;
+    for (let i = 0; i < bytes.length; i++) {
+      c = (CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8)) >>> 0;
+    }
+    return c >>> 0;
+  }
+
+  const crcFinal = (state) => ((state ^ 0xFFFFFFFF) >>> 0);
+
+  function crc32(bytes) {
+    return crcFinal(crcUpdate(crcInit(), bytes));
+  }
+
+  // Exponential moving average. A naive total/elapsed rate keeps reporting a
+  // number from thirty seconds ago; this tracks what the link is doing now.
+  function ema(previous, sample, alpha) {
+    if (previous === null || previous === undefined || !isFinite(previous)) return sample;
+    const a = alpha === undefined ? 0.3 : alpha;
+    return previous + a * (sample - previous);
+  }
+
   function eta(doneBytes, totalBytes, elapsedSecs) {
     if (doneBytes <= 0 || elapsedSecs <= 0) return null;
     const rate = doneBytes / elapsedSecs;
@@ -112,7 +153,8 @@ DL.util = (function () {
 
   return {
     PACKED, bytes, duration, newId, shouldCompress, sealSize,
-    chunkSize, throttle, dedupeNames, safeName, safePath, eta,
+    chunkSize, throttle, dedupeNames, safeName, safePath, eta, ema,
+    crc32, crcInit, crcUpdate, crcFinal,
   };
 })();
 
@@ -168,7 +210,7 @@ DL.protocol = (function () {
   const accept  = (batchId) => JSON.stringify({ t: T.ACCEPT, batchId });
   const decline = (batchId, reason) => JSON.stringify({ t: T.DECLINE, batchId, reason });
   const begin   = (itemId) => JSON.stringify({ t: T.BEGIN, itemId });
-  const end     = (itemId) => JSON.stringify({ t: T.END, itemId });
+  const end     = (itemId, crc, bytes) => JSON.stringify({ t: T.END, itemId, crc, bytes });
   const done    = (batchId) => JSON.stringify({ t: T.DONE, batchId });
   const hold    = () => JSON.stringify({ t: T.HOLD });
   const go      = () => JSON.stringify({ t: T.GO });
@@ -285,8 +327,17 @@ DL.transfer = (function () {
 
     let read = 0;
     let wire = 0;
+    let crc = DL.util.crcInit();
 
-    let stream = file.stream().pipeThrough(meter((n) => { read += n; opts.onProgress(read); }));
+    // Checksummed before compression so both ends hash the same plaintext.
+    let stream = file.stream().pipeThrough(new TransformStream({
+      transform(chunk, ctrl) {
+        read += chunk.byteLength;
+        crc = DL.util.crcUpdate(crc, chunk);
+        opts.onProgress(read);
+        ctrl.enqueue(chunk);
+      },
+    }));
     if (opts.gzip) stream = stream.pipeThrough(new CompressionStream('gzip'));
 
     const reader = stream.getReader();
@@ -317,7 +368,7 @@ DL.transfer = (function () {
       reader.cancel().catch(() => {});
     }
 
-    return { read, wire };
+    return { read, wire, crc: DL.util.crcFinal(crc) };
   }
 
   function concat(a, b) {
@@ -400,14 +451,21 @@ DL.session = (function () {
     const base = (cfg.iceServers && cfg.iceServers.length) ? cfg.iceServers.slice() : DEFAULT_ICE.slice();
     if (!cfg.turnCredentialsUrl) return base;
     try {
-      const res = await fetch(cfg.turnCredentialsUrl, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`turn endpoint ${res.status}`);
-      const data = await res.json();
+      // Bounded: this sits in front of every session, so a slow or dead
+      // endpoint must not become a slow or dead app.
+      const res = await fetch(cfg.turnCredentialsUrl, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(cfg.turnTimeoutMs || 4000),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.hint || data.error || `turn endpoint ${res.status}`);
       const extra = data.iceServers || (data.urls ? [data] : []);
+      if (!extra.length) throw new Error('turn endpoint returned no iceServers');
       return base.concat(extra);
     } catch (err) {
-      // A missing relay costs reliability, not correctness — carry on with STUN.
-      console.warn('dropline: TURN unavailable, continuing without a relay', err);
+      // A missing relay costs reliability, not correctness — carry on with
+      // STUN. Roughly 10-20% of network pairs will fail to connect without it.
+      console.warn('dropline: TURN unavailable, continuing with STUN only —', err.message || err);
       return base;
     }
   }
@@ -620,7 +678,7 @@ DL.session = (function () {
         }
 
         case P.T.BEGIN: await beginItem(msg.itemId); break;
-        case P.T.END:   await endItem(msg.itemId); break;
+        case P.T.END:   await endItem(msg.itemId, msg.crc, msg.bytes); break;
 
         case P.T.DONE:
           if (incoming) { emit('batchDone', incoming); incoming = null; }
@@ -655,45 +713,83 @@ DL.session = (function () {
 
       const tick = DL.util.throttle(() => emit('item', { ...item }), 70);
 
+      item.crc = DL.util.crcInit();
+
       let stream = readable;
       if (item.gzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
-      stream = stream.pipeThrough(DL.transfer.meter((n) => {
-        item.done += n;
-        tick();
-        if (inbound.held && inbound.sink && inbound.sink.desiredSize > 0) {
-          inbound.held = false;
-          send(P.go());
-        }
+
+      // Checksum after decompression, so this hashes the same plaintext the
+      // sender hashed before compressing it.
+      stream = stream.pipeThrough(new TransformStream({
+        transform(chunk, ctrl) {
+          item.done += chunk.byteLength;
+          item.crc = DL.util.crcUpdate(item.crc, chunk);
+          tick();
+          if (inbound.held && inbound.sink && inbound.sink.desiredSize > 0) {
+            inbound.held = false;
+            send(P.go());
+          }
+          ctrl.enqueue(chunk);
+        },
       }));
 
       let blob = null;
       const dest = await DL.transfer.sinkFor(incoming.dest, item, (b) => { blob = b; });
       incoming.pipe = stream.pipeTo(dest).then(() => {
-        item.state = 'done';
         item.blob = blob;
         item.elapsed = (Date.now() - item.startedAt) / 1000;
         item.savedToDisk = incoming.dest.kind !== 'seal';
-        emit('item', { ...item });
+        // State is settled in endItem, once the sender's checksum has arrived.
       });
     }
 
-    async function endItem(itemId) {
-      if (!incoming || !incoming.sink) return;
-      try { incoming.sink.close(); } catch { /* already closed */ }
-      incoming.sink = null;
+    async function endItem(itemId, expectedCrc, expectedBytes) {
+      if (!incoming) return;
+      const item = incoming.items.find((i) => i.id === itemId);
+
+      if (incoming.sink) {
+        try { incoming.sink.close(); } catch { /* already closed */ }
+        incoming.sink = null;
+      }
       inbound.sink = null;
       if (inbound.held) { inbound.held = false; send(P.go()); }
-      try { await incoming.pipe; } catch (err) {
-        const item = incoming.items.find((i) => i.id === itemId);
+
+      try {
+        await incoming.pipe;
+      } catch {
         if (item) emit('item', { ...item, state: 'failed', detail: 'Could not write the file.' });
+        return;
       }
+      if (!item) return;
+
+      // The transport is reliable and ordered, so a mismatch means a bug on one
+      // side rather than a lossy link — which is exactly why it is worth
+      // checking. Silent corruption is the one failure nobody notices.
+      const got = DL.util.crcFinal(item.crc);
+      const sizeOk = expectedBytes === undefined || item.done === expectedBytes;
+      const crcOk = expectedCrc === undefined || got === expectedCrc;
+
+      if (crcOk && sizeOk) {
+        item.state = 'done';
+        item.verified = expectedCrc !== undefined;
+      } else {
+        item.state = 'failed';
+        item.detail = sizeOk
+          ? 'Checksum mismatch — the file arrived corrupted.'
+          : `Incomplete — expected ${expectedBytes} bytes, got ${item.done}.`;
+      }
+      emit('item', { ...item });
     }
 
     // Called from a click: the file pickers need a user gesture.
-    async function acceptOffer() {
+    async function acceptOffer(opts) {
       if (!offer) return;
       const files = offer.items.filter((i) => i.kind === 'file');
-      const dest = await DL.transfer.chooseDestination(files);
+      // Auto-accept has no user gesture, so no picker may be opened; those
+      // transfers land via the sealing path and a download link.
+      const dest = (opts && opts.silent)
+        ? { kind: 'seal' }
+        : await DL.transfer.chooseDestination(files);
       if (!dest) return; // cancelled — leave the offer standing
       incoming = { ...offer, dest, sink: null, pipe: null };
       offer = null;
@@ -778,13 +874,13 @@ DL.session = (function () {
           (n) => emit('item', { ...item, dir: 'out', state: 'active', done: n }), 70);
 
         send(P.begin(item.id));
-        const { wire: onWire } = await DL.transfer.pumpFile(conn, entry.file, {
+        const { wire: onWire, crc } = await DL.transfer.pumpFile(conn, entry.file, {
           gzip: entry.gzip,
           flow: gate,
           isLive: live,
           onProgress: tick,
         });
-        send(P.end(item.id));
+        send(P.end(item.id, crc, item.size));
 
         emit('item', {
           ...item, dir: 'out', state: 'done', done: item.size,
@@ -846,72 +942,121 @@ DL.ui = (function () {
 
   const el = {};
   let session = null;
-  const items = new Map();   // itemId -> latest state, both directions
+  const items = new Map();
   let announceTimer = null;
+  let wakeLock = null;
+  let autoAccept = false;
+  const objectUrls = [];
 
-  function cache() {
-    ['view-invite', 'view-session', 'view-error', 'qr', 'share-link', 'copy-btn',
-     'invite-status', 'conn-status', 'offer-card', 'offer-summary', 'offer-accept',
-     'offer-decline', 'drop', 'file-input', 'folder-input', 'pick-files',
-     'pick-folder', 'text-input', 'send-text', 'transfer-list', 'empty-note',
-     'error-msg', 'error-reset', 'live', 'invite-again', 'session-link',
-     'session-copy'].forEach((id) => { el[id.replace(/-(\w)/g, (_, c) => c.toUpperCase())] = $(id); });
-  }
+  const IDS = ['app', 'statusline', 'live', 'view-invite', 'view-session', 'view-error',
+    'qr', 'share-link', 'copy-btn', 'share-btn', 'offer-card', 'offer-summary',
+    'offer-accept', 'offer-decline', 'drop', 'file-input', 'folder-input',
+    'act-files', 'act-folder', 'act-text', 'auto-accept', 'text-wrap', 'text-input',
+    'send-text', 'transfer-list', 'empty-note', 'session-stats', 'error-msg',
+    'error-reset', 'veil'];
 
-  /* ── announcements for assistive tech ── */
+  const key = (id) => id.replace(/-(\w)/g, (_, c) => c.toUpperCase());
+
+  /* ── announcements ── */
 
   function announce(text) {
     if (!el.live) return;
     clearTimeout(announceTimer);
+    // Re-announce identical text by clearing first; screen readers ignore a
+    // live region whose content did not change.
+    el.live.textContent = '';
     announceTimer = setTimeout(() => { el.live.textContent = text; }, 120);
   }
 
-  /* ── views ── */
+  /* ── views and state ── */
 
   function show(name) {
-    el.viewInvite.hidden = name !== 'invite';
-    el.viewSession.hidden = name !== 'session';
-    el.viewError.hidden = name !== 'error';
+    const swap = () => {
+      el.viewInvite.hidden = name !== 'invite';
+      el.viewSession.hidden = name !== 'session';
+      el.viewError.hidden = name !== 'error';
+    };
+    // View Transitions where available; a plain swap everywhere else.
+    if (document.startViewTransition && !prefersReducedMotion()) {
+      document.startViewTransition(swap);
+    } else {
+      swap();
+    }
   }
 
-  function fail(message) {
-    el.errorMsg.textContent = message;
-    show('error');
-    announce(`Error. ${message}`);
-  }
+  const prefersReducedMotion = () =>
+    window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function setAppState(state) { el.app.dataset.state = state; }
 
   const STATUS_TEXT = {
-    idle: 'Starting…',
-    waiting: 'Waiting for someone to open the link',
-    connecting: 'Connecting…',
-    reconnecting: 'Connection lost — reconnecting…',
+    idle: 'Starting up',
+    waiting: 'Waiting for the other device',
+    connecting: 'Connecting',
+    reconnecting: 'Connection lost — reconnecting',
     connected: 'Connected',
     failed: 'Could not connect',
     closed: 'The other device left',
   };
 
+  let connState = 'idle';
+
   function setStatus(state) {
-    const text = STATUS_TEXT[state] || state;
-    const live = state === 'connected';
-
-    if (el.inviteStatus) {
-      el.inviteStatus.innerHTML = '';
-      if (!live && state !== 'failed') el.inviteStatus.append(dot());
-      el.inviteStatus.append(text);
-    }
-    if (el.connStatus) {
-      el.connStatus.innerHTML = '';
-      el.connStatus.append(live ? okDot() : dot());
-      el.connStatus.append(text);
-      el.connStatus.dataset.state = state;
-    }
-
+    connState = state;
+    el.statusline.textContent = STATUS_TEXT[state] || state;
+    setAppState(state === 'connected' && anyActive() ? 'busy' : state);
     if (state === 'connected') show('session');
-    announce(text);
+    if (state === 'failed') show('error');
+    announce(STATUS_TEXT[state] || state);
   }
 
-  const dot = () => Object.assign(document.createElement('span'), { className: 'dot' });
-  const okDot = () => Object.assign(document.createElement('span'), { className: 'dot dot-ok' });
+  const anyActive = () => [...items.values()].some((i) => i.state === 'active');
+
+  function refreshBusy() {
+    if (connState !== 'connected') return;
+    setAppState(anyActive() ? 'busy' : 'connected');
+  }
+
+  function fail(message) {
+    el.errorMsg.textContent = message;
+    setAppState('failed');
+    show('error');
+    announce(`Error. ${message}`);
+  }
+
+  /* ── screen wake lock ──
+     A phone that sleeps mid-transfer drops the connection and loses the file.
+     Holding the lock only while bytes are moving is the whole point. */
+
+  async function updateWakeLock() {
+    const needed = anyActive();
+    try {
+      if (needed && !wakeLock && 'wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      } else if (!needed && wakeLock) {
+        await wakeLock.release();
+        wakeLock = null;
+      }
+    } catch {
+      // Denied or unsupported. Nothing breaks; the screen may just sleep.
+    }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') updateWakeLock();
+  });
+
+  /* ── document title as a progress readout ── */
+
+  function updateTitle() {
+    const active = [...items.values()].filter((i) => i.state === 'active' && i.size);
+    if (!active.length) { document.title = 'dropline'; return; }
+    const done = active.reduce((n, i) => n + (i.done || 0), 0);
+    const total = active.reduce((n, i) => n + i.size, 0);
+    const pct = total ? Math.floor((done / total) * 100) : 0;
+    document.title = `${pct}% · dropline`;
+  }
 
   /* ── QR ── */
 
@@ -948,10 +1093,10 @@ DL.ui = (function () {
     const original = label || button.textContent;
     button.textContent = 'Copied';
     announce('Link copied');
-    setTimeout(() => { button.textContent = original; }, 1600);
+    setTimeout(() => { button.textContent = original; }, 1500);
   }
 
-  /* ── transfer list ── */
+  /* ── transfer rows ── */
 
   function upsert(item) {
     const previous = items.get(item.id) || {};
@@ -959,103 +1104,164 @@ DL.ui = (function () {
     items.set(item.id, merged);
     render(merged);
 
-    if (merged.state === 'done' && previous.state !== 'done') {
-      announce(`${merged.dir === 'in' ? 'Received' : 'Sent'} ${merged.name}`);
+    if (merged.state !== previous.state) {
+      if (merged.state === 'done') {
+        announce(`${merged.dir === 'in' ? 'Received' : 'Sent'} ${merged.name}`);
+      } else if (merged.state === 'failed') {
+        announce(`Failed: ${merged.name}. ${merged.detail || ''}`);
+      }
+      refreshBusy();
+      updateWakeLock();
+      renderStats();
     }
-    if (merged.state === 'failed' && previous.state !== 'failed') {
-      announce(`Failed: ${merged.name}`);
-    }
+    updateTitle();
   }
 
   function render(item) {
-    let row = document.getElementById(`row-${item.id}`);
+    let row = $(`row-${item.id}`);
     if (!row) {
       row = document.createElement('li');
       row.id = `row-${item.id}`;
-      row.className = 'row';
-      row.innerHTML = `
-        <div class="row-head">
-          <span class="row-dir" aria-hidden="true"></span>
-          <span class="row-name"></span>
-          <span class="row-meta"></span>
-        </div>
-        <div class="row-bar"><div class="row-fill"></div></div>
-        <div class="row-foot"><span class="row-state"></span><span class="row-actions"></span></div>`;
+      row.className = 'row-item';
+      row.innerHTML =
+        '<div class="item-head">' +
+          '<span class="item-dir" aria-hidden="true"></span>' +
+          '<span class="item-name"></span>' +
+          '<span class="item-size"></span>' +
+        '</div>' +
+        '<div class="bar"><div class="bar-fill"></div></div>' +
+        '<div class="item-foot"><span class="item-state"></span><span class="item-actions"></span></div>';
       el.transferList.prepend(row);
       el.emptyNote.hidden = true;
     }
 
-    const pct = item.size ? Math.min(100, (item.done || 0) / item.size * 100) : (item.state === 'done' ? 100 : 0);
-    const bar = row.querySelector('.row-bar');
-    const fill = row.querySelector('.row-fill');
+    const pct = item.size
+      ? Math.min(100, ((item.done || 0) / item.size) * 100)
+      : (item.state === 'done' ? 100 : 0);
 
-    row.querySelector('.row-dir').textContent = item.dir === 'in' ? '↓' : '↑';
     row.dataset.dir = item.dir;
     row.dataset.state = item.state;
-    row.querySelector('.row-name').textContent =
+    row.querySelector('.item-dir').textContent = item.dir === 'in' ? '↓' : '↑';
+    row.querySelector('.item-name').textContent =
       (item.path && item.path.length ? item.path.join('/') + '/' : '') + item.name;
-    row.querySelector('.row-meta').textContent = item.kind === 'text' ? 'text' : U.bytes(item.size);
+    row.querySelector('.item-size').textContent =
+      item.kind === 'text' ? 'text' : U.bytes(item.size);
 
-    fill.style.width = `${pct}%`;
+    const bar = row.querySelector('.bar');
+    row.querySelector('.bar-fill').style.width = `${pct}%`;
     bar.setAttribute('role', 'progressbar');
     bar.setAttribute('aria-valuemin', '0');
     bar.setAttribute('aria-valuemax', '100');
     bar.setAttribute('aria-valuenow', String(Math.round(pct)));
     bar.setAttribute('aria-label', `${item.name} ${item.dir === 'in' ? 'download' : 'upload'}`);
 
-    row.querySelector('.row-state').textContent = stateText(item, pct);
-    renderActions(row.querySelector('.row-actions'), item);
+    row.querySelector('.item-state').innerHTML = stateHtml(item, pct);
+    renderActions(row, item);
+    renderThumb(row, item);
   }
 
-  function stateText(item, pct) {
+  // Rate is smoothed: a running total/elapsed average reports a number from
+  // half a minute ago and jitters wildly at the start.
+  function liveRate(item) {
+    const now = Date.now();
+    if (!item.rateAt) { item.rateAt = now; item.rateBytes = item.done || 0; return item.rate || 0; }
+    const dt = (now - item.rateAt) / 1000;
+    if (dt < 0.25) return item.rate || 0;
+    const sample = ((item.done || 0) - item.rateBytes) / dt;
+    item.rate = U.ema(item.rate, sample, 0.35);
+    item.rateAt = now;
+    item.rateBytes = item.done || 0;
+    return item.rate;
+  }
+
+  function stateHtml(item, pct) {
     switch (item.state) {
-      case 'offered':  return item.dir === 'in' ? 'Offered' : 'Waiting for them to accept…';
+      case 'offered':
+        return item.dir === 'in' ? 'Offered' : 'Waiting for them to accept';
       case 'declined': return 'Declined';
-      case 'failed':   return item.detail || 'Failed';
+      case 'failed':   return escape(item.detail || 'Failed');
       case 'active': {
-        const secs = item.startedAt ? (Date.now() - item.startedAt) / 1000 : 0;
-        const rate = secs > 0 && item.done ? `${U.bytes(item.done / secs)}/s` : '';
-        const left = U.eta(item.done, item.size, secs);
-        return [`${pct.toFixed(0)}%`, rate, left ? `${U.duration(left)} left` : '']
-          .filter(Boolean).join(' · ');
+        const rate = liveRate(item);
+        const left = rate > 0 ? (item.size - (item.done || 0)) / rate : null;
+        return [
+          `${pct.toFixed(0)}%`,
+          rate > 0 ? `${U.bytes(rate)}/s` : '',
+          left && isFinite(left) && left > 0.5 ? `${U.duration(left)} left` : '',
+        ].filter(Boolean).join(' · ');
       }
       case 'done': {
         if (item.kind === 'text') return 'Received';
         const rate = item.elapsed ? ` · ${U.bytes(item.size / item.elapsed)}/s` : '';
-        const shrunk = item.wire && item.wire < item.size ? ` · ${U.bytes(item.wire)} on the wire` : '';
+        const shrunk = item.wire && item.wire < item.size
+          ? ` · ${U.bytes(item.wire)} sent` : '';
         if (item.dir === 'out') return `Sent${rate}${shrunk}`;
-        return (item.savedToDisk ? 'Saved to disk' : 'Ready') + rate;
+        const tick = item.verified ? '<span class="check">✓</span> ' : '';
+        return `${tick}${item.savedToDisk ? 'Saved' : 'Ready'}${rate}`;
       }
       default: return '';
     }
   }
 
-  function renderActions(box, item) {
-    box.innerHTML = '';
-    if (item.state !== 'done') return;
+  const escape = (s) => String(s).replace(/[&<>"]/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  function renderActions(row, item) {
+    const box = row.querySelector('.item-actions');
+    if (item.state !== 'done' || box.dataset.filled) return;
 
     if (item.kind === 'text') {
-      const pre = document.createElement('pre');
-      pre.className = 'snippet';
-      pre.textContent = item.body || '';
-      box.parentElement.after(pre);
+      if (!row.querySelector('.snippet')) {
+        const pre = document.createElement('pre');
+        pre.className = 'snippet';
+        pre.textContent = item.body || '';
+        row.append(pre);
+      }
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'mini';
+      btn.className = 'act';
       btn.textContent = 'Copy';
       btn.addEventListener('click', () => copy(item.body || '', btn, 'Copy'));
       box.append(btn);
+      box.dataset.filled = '1';
       return;
     }
 
     if (item.dir === 'in' && item.blob && !item.savedToDisk) {
+      const url = URL.createObjectURL(item.blob);
+      objectUrls.push(url);
       const link = document.createElement('a');
-      link.className = 'mini mini-strong';
+      link.className = 'act act-strong';
       link.textContent = 'Download';
       link.download = item.name;
-      link.href = URL.createObjectURL(item.blob);
+      link.href = url;
       box.append(link);
+      box.dataset.filled = '1';
     }
+  }
+
+  // A received image is far more recognisable than its filename.
+  function renderThumb(row, item) {
+    if (item.dir !== 'in' || item.state !== 'done' || !item.blob) return;
+    if (!/^image\//.test(item.mime || '') || row.querySelector('.item-thumb')) return;
+    const url = URL.createObjectURL(item.blob);
+    objectUrls.push(url);
+    const img = document.createElement('img');
+    img.className = 'item-thumb';
+    img.alt = '';
+    img.src = url;
+    row.querySelector('.item-head').insertBefore(img, row.querySelector('.item-name'));
+  }
+
+  function renderStats() {
+    const done = [...items.values()].filter((i) => i.state === 'done' && i.kind === 'file');
+    if (!done.length) { el.sessionStats.hidden = true; return; }
+    const bytes = done.reduce((n, i) => n + (i.size || 0), 0);
+    const sent = done.filter((i) => i.dir === 'out').length;
+    const got = done.length - sent;
+    el.sessionStats.hidden = false;
+    el.sessionStats.textContent =
+      `${done.length} file${done.length > 1 ? 's' : ''} · ${U.bytes(bytes)} · ` +
+      `${sent} sent, ${got} received`;
   }
 
   /* ── offers ── */
@@ -1063,26 +1269,33 @@ DL.ui = (function () {
   function showOffer(batch) {
     const files = batch.items.filter((i) => i.kind === 'file');
     const total = DL.protocol.totalBytes(batch.items);
-    const names = batch.items.slice(0, 3).map((i) => i.name).join(', ');
-    const more = batch.items.length > 3 ? ` and ${batch.items.length - 3} more` : '';
+    const names = batch.items.slice(0, 2).map((i) => i.name).join(', ');
+    const more = batch.items.length > 2 ? ` +${batch.items.length - 2} more` : '';
 
     el.offerSummary.textContent = files.length
-      ? `${batch.items.length} item${batch.items.length > 1 ? 's' : ''} · ${U.bytes(total)} — ${names}${more}`
+      ? `${names}${more} — ${U.bytes(total)}`
       : `${names}${more}`;
 
     el.offerAccept.textContent = files.length > 1 && DL.transfer.HAS_DIR
-      ? 'Choose a folder & accept'
+      ? 'Choose folder & accept'
       : (files.length === 1 && DL.transfer.HAS_SAVE ? 'Choose where to save' : 'Accept');
 
-    el.offerCard.hidden = false;
     batch.items.forEach((i) => upsert(i));
+
+    if (autoAccept) {
+      // No picker without a gesture, so this lands via the sealing path.
+      session.acceptOffer({ silent: true });
+      announce(`Accepting ${el.offerSummary.textContent}`);
+      return;
+    }
+
+    el.offerCard.hidden = false;
     announce(`Incoming: ${el.offerSummary.textContent}`);
     el.offerAccept.focus();
   }
 
   /* ── input collection ── */
 
-  // Folder drops arrive as directory entries, which have to be walked.
   async function filesFromDrop(dataTransfer) {
     const entries = Array.from(dataTransfer.items || [])
       .map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null))
@@ -1091,7 +1304,6 @@ DL.ui = (function () {
     if (!entries.length) {
       return Array.from(dataTransfer.files).map((file) => ({ file, path: '' }));
     }
-
     const out = [];
     for (const entry of entries) await walk(entry, '', out);
     return out;
@@ -1114,23 +1326,39 @@ DL.ui = (function () {
   }
 
   function offerLocal(picked) {
-    if (!picked.length) return;
-    const entries = picked.map(({ file, path }) => ({
+    if (!picked.length || !session) return;
+    session.sendFiles(picked.map(({ file, path }) => ({
       kind: 'file', file, name: file.name, size: file.size, mime: file.type, path,
-    }));
-    session.sendFiles(entries);
+    })));
   }
 
   /* ── wiring ── */
 
   function wire() {
     el.copyBtn.addEventListener('click', () => copy(el.shareLink.value, el.copyBtn, 'Copy link'));
-    if (el.sessionCopy) {
-      el.sessionCopy.addEventListener('click', () => copy(el.sessionLink.value, el.sessionCopy, 'Copy link'));
+
+    // Native share sheet is the natural way to get a link onto a phone.
+    if (navigator.share) {
+      el.shareBtn.hidden = false;
+      el.shareBtn.addEventListener('click', () => {
+        navigator.share({ title: 'dropline', url: el.shareLink.value }).catch(() => {});
+      });
     }
 
-    el.pickFiles.addEventListener('click', () => el.fileInput.click());
-    el.pickFolder.addEventListener('click', () => el.folderInput.click());
+    el.actFiles.addEventListener('click', () => el.fileInput.click());
+    el.actFolder.addEventListener('click', () => el.folderInput.click());
+
+    el.actText.addEventListener('click', () => {
+      const open = el.textWrap.hidden;
+      el.textWrap.hidden = !open;
+      el.actText.setAttribute('aria-expanded', String(open));
+      if (open) el.textInput.focus();
+    });
+
+    el.autoAccept.addEventListener('change', () => {
+      autoAccept = el.autoAccept.checked;
+      announce(autoAccept ? 'Auto-accept on' : 'Auto-accept off');
+    });
 
     el.fileInput.addEventListener('change', () => {
       offerLocal(Array.from(el.fileInput.files).map((file) => ({ file, path: '' })));
@@ -1145,33 +1373,36 @@ DL.ui = (function () {
       el.folderInput.value = '';
     });
 
+    el.drop.addEventListener('click', () => el.fileInput.click());
     el.drop.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.fileInput.click(); }
     });
-    el.drop.addEventListener('click', () => el.fileInput.click());
 
-    for (const type of ['dragenter', 'dragover']) {
-      el.drop.addEventListener(type, (e) => { e.preventDefault(); el.drop.classList.add('hot'); });
-    }
-    for (const type of ['dragleave', 'drop']) {
-      el.drop.addEventListener(type, () => el.drop.classList.remove('hot'));
-    }
-    el.drop.addEventListener('drop', async (e) => {
+    // Drag anywhere on the page, not just onto the box.
+    let dragDepth = 0;
+    window.addEventListener('dragenter', (e) => {
+      if (!hasFiles(e)) return;
+      dragDepth++;
+      document.body.classList.add('dragging');
+    });
+    window.addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
+    window.addEventListener('dragleave', () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (!dragDepth) document.body.classList.remove('dragging');
+    });
+    window.addEventListener('drop', async (e) => {
+      if (!hasFiles(e)) return;
       e.preventDefault();
+      dragDepth = 0;
+      document.body.classList.remove('dragging');
       offerLocal(await filesFromDrop(e.dataTransfer));
     });
 
-    el.sendText.addEventListener('click', () => {
-      if (session.sendText(el.textInput.value)) el.textInput.value = '';
-    });
+    el.sendText.addEventListener('click', sendText);
     el.textInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        if (session.sendText(el.textInput.value)) el.textInput.value = '';
-      }
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendText(); }
     });
 
-    // Paste a screenshot or a snippet straight into the page.
     window.addEventListener('paste', (e) => {
       if (!session || document.activeElement === el.textInput) return;
       const files = Array.from(e.clipboardData.files || []);
@@ -1186,23 +1417,45 @@ DL.ui = (function () {
       try { await session.acceptOffer(); } finally { el.offerAccept.disabled = false; }
       el.offerCard.hidden = true;
     });
-    el.offerDecline.addEventListener('click', () => {
-      session.declineOffer();
-      el.offerCard.hidden = true;
+
+    el.offerDecline.addEventListener('click', declineOffer);
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !el.offerCard.hidden) declineOffer();
     });
 
     el.errorReset.addEventListener('click', () => { location.href = location.pathname; });
 
     window.addEventListener('beforeunload', (e) => {
-      const busy = [...items.values()].some((i) => i.state === 'active');
-      if (busy) { e.preventDefault(); e.returnValue = ''; }
+      if (anyActive()) { e.preventDefault(); e.returnValue = ''; }
     });
+
+    window.addEventListener('pagehide', () => {
+      objectUrls.forEach((u) => URL.revokeObjectURL(u));
+    });
+  }
+
+  const hasFiles = (e) =>
+    e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+
+  function sendText() {
+    if (session.sendText(el.textInput.value)) {
+      el.textInput.value = '';
+      el.textWrap.hidden = true;
+      el.actText.setAttribute('aria-expanded', 'false');
+    }
+  }
+
+  function declineOffer() {
+    session.declineOffer();
+    el.offerCard.hidden = true;
+    announce('Declined');
   }
 
   /* ── boot ── */
 
   function boot() {
-    cache();
+    IDS.forEach((id) => { el[key(id)] = $(id); });
     wire();
 
     const hash = location.hash.slice(1);
@@ -1211,26 +1464,18 @@ DL.ui = (function () {
     show(isGuest ? 'session' : 'invite');
     setStatus(isGuest ? 'connecting' : 'idle');
 
-    // The host learns its link from the session; a guest already has it in the
-    // address bar, and without this its Copy button would copy an empty string.
-    if (isGuest && el.sessionLink) {
-      el.sessionLink.value = `${location.origin}${location.pathname}#${hash}`;
-    }
+    if (isGuest) el.shareLink.value = `${location.origin}${location.pathname}#${hash}`;
 
     session = DL.session.create({
       role: isGuest ? 'guest' : 'host',
       hostId: isGuest ? hash : null,
       on: {
-        link(url) {
-          el.shareLink.value = url;
-          if (el.sessionLink) el.sessionLink.value = url;
-          drawQr(url);
-        },
+        link(url) { el.shareLink.value = url; drawQr(url); },
         status: setStatus,
         offer: showOffer,
         item: upsert,
-        error: (msg) => {
-          if (el.viewSession.hidden && el.viewInvite.hidden) fail(msg);
+        error(msg) {
+          if (connState === 'failed') fail(msg);
           else announce(msg);
         },
       },

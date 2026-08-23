@@ -4,98 +4,93 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>dropline — direct file transfer</title>
+<title>dropline</title>
 <meta name="description" content="Send files straight between two browsers. Nothing is uploaded, nothing is stored.">
-<link rel="stylesheet" href="style.4b1cedf252.css">
+<link rel="stylesheet" href="style.cb2a0adc52.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='3' fill='%23D97757'/></svg>">
 </head>
 <body>
 
-<main>
-  <header>
-    <div class="wordmark"><span class="mark" aria-hidden="true"></span>dropline</div>
-    <p class="lede">Files move straight from one browser to the other. No upload, no storage, no account.</p>
+<!-- data-state drives every motion cue in the page from one place. -->
+<main id="app" data-state="idle">
+
+  <header class="head">
+    <h1 class="wordmark">
+      <span class="mark" aria-hidden="true"><i></i></span>dropline
+    </h1>
+    <p class="statusline" id="statusline"></p>
   </header>
 
-  <!-- Screen-reader announcements for state the sighted user sees as motion. -->
   <p id="live" class="sr-only" role="status" aria-live="polite"></p>
 
-  <!-- ── Invite: host, before anyone has joined ─────────────────── -->
-  <section id="view-invite" class="panel" hidden>
-    <div class="handoff">
-      <div class="qr" id="qr"></div>
-      <div class="handoff-text">
-        <p class="label">Open this on the other device</p>
-        <input type="text" id="share-link" readonly spellcheck="false" aria-label="Session link">
-        <button id="copy-btn" type="button" class="btn btn-primary">Copy link</button>
-        <p class="note">Or scan the code with a phone camera.</p>
+  <!-- ── Invite ─────────────────────────────────────────────── -->
+  <section id="view-invite" class="view" hidden>
+    <div class="qr" id="qr"></div>
+    <div class="invite-actions">
+      <input type="text" id="share-link" readonly spellcheck="false" aria-label="Session link">
+      <div class="row">
+        <button id="copy-btn" type="button" class="act">Copy link</button>
+        <button id="share-btn" type="button" class="act" hidden>Share</button>
       </div>
     </div>
-    <p class="status" id="invite-status"></p>
-    <p class="warn">Keep this tab open — the connection lives in the page.</p>
+    <p class="hint">Open the link on the other device, or scan the code.</p>
   </section>
 
-  <!-- ── Session: connected, either side can send ───────────────── -->
-  <section id="view-session" class="panel" hidden>
-    <p class="status" id="conn-status"></p>
+  <!-- ── Session ────────────────────────────────────────────── -->
+  <section id="view-session" class="view" hidden>
 
-    <div class="linkrow linkrow-tight">
-      <input type="text" id="session-link" readonly spellcheck="false" aria-label="Session link">
-      <button id="session-copy" type="button" class="mini">Copy link</button>
-    </div>
-
-    <!-- Incoming batch awaiting a decision -->
     <div id="offer-card" class="offer" hidden>
-      <p class="offer-title">Incoming</p>
       <p class="offer-summary" id="offer-summary"></p>
-      <div class="offer-actions">
-        <button id="offer-accept" type="button" class="btn btn-primary">Accept</button>
-        <button id="offer-decline" type="button" class="btn btn-quiet">Decline</button>
+      <div class="row">
+        <button id="offer-accept" type="button" class="act act-strong">Accept</button>
+        <button id="offer-decline" type="button" class="act">Decline</button>
       </div>
     </div>
 
-    <!-- Composer -->
-    <div id="drop" class="drop" tabindex="0" role="button" aria-label="Add files to send">
-      <span class="dz-title">Drop files or a folder</span>
-      <span class="dz-sub">or click to choose · ⌘V pastes a screenshot</span>
+    <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose files to send">
+      <span class="drop-title">Drop anything</span>
+      <span class="drop-sub">files, a folder, or paste an image</span>
     </div>
 
-    <div class="composer-row">
-      <button id="pick-files" type="button" class="mini">Choose files</button>
-      <button id="pick-folder" type="button" class="mini">Choose folder</button>
+    <div class="row row-acts">
+      <button id="act-files" type="button" class="act">Files</button>
+      <button id="act-folder" type="button" class="act">Folder</button>
+      <button id="act-text" type="button" class="act" aria-expanded="false">Text</button>
+      <label class="auto" title="Skip the accept step for this session">
+        <input type="checkbox" id="auto-accept"> auto-accept
+      </label>
     </div>
 
-    <div class="composer-text">
-      <label class="label" for="text-input">Or send text</label>
-      <textarea id="text-input" rows="2" placeholder="A link, a password, a snippet…"></textarea>
-      <button id="send-text" type="button" class="mini">Send text</button>
+    <div id="text-wrap" class="text-wrap" hidden>
+      <textarea id="text-input" rows="2" placeholder="A link, a password, a snippet…" aria-label="Text to send"></textarea>
+      <button id="send-text" type="button" class="act">Send</button>
     </div>
 
     <input type="file" id="file-input" multiple hidden>
     <input type="file" id="folder-input" webkitdirectory directory hidden>
 
-    <h2 class="label list-label">Transfers</h2>
-    <p class="note" id="empty-note">Nothing yet. Anything either of you sends shows up here.</p>
     <ul class="list" id="transfer-list"></ul>
+    <p class="hint" id="empty-note">Anything either of you sends appears here.</p>
+    <p class="stats" id="session-stats" hidden></p>
   </section>
 
-  <!-- ── Error ──────────────────────────────────────────────────── -->
-  <section id="view-error" class="panel" hidden>
-    <div class="meta">
-      <h1 class="fname">Something went wrong</h1>
-      <p class="fsub" id="error-msg"></p>
-    </div>
-    <button class="btn btn-quiet" id="error-reset" type="button">Start over</button>
+  <!-- ── Error ──────────────────────────────────────────────── -->
+  <section id="view-error" class="view" hidden>
+    <p class="err" id="error-msg"></p>
+    <button class="act" id="error-reset" type="button">Start over</button>
   </section>
 
-  <footer>
-    <span>Encrypted peer-to-peer over WebRTC</span>
+  <footer class="foot">
+    <span>Encrypted peer-to-peer</span>
     <span class="foot-links">
       <a href="updates.html">Updates</a>
       <a href="https://github.com/Aidiotic/dropline">Source</a>
     </span>
   </footer>
 </main>
+
+<!-- Full-page drag target: dropping anywhere should work, not just the box. -->
+<div id="veil" class="veil" aria-hidden="true"><span>Release to send</span></div>
 
 <script src="config.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"
@@ -104,6 +99,6 @@
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"
         integrity="sha384-lQXOAyZwHXE55JFyrOMB7nY2Wv+m5ZWNtJcHrd1rceRQXAYNLak8ukN5TjBTcIwz"
         crossorigin="anonymous"></script>
-<script src="dropline.3216a67259.js"></script>
+<script src="dropline.04c8aa5dc3.js"></script>
 </body>
 </html>

@@ -99,6 +99,47 @@ DL.util = (function () {
     return parts.slice(0, 16); // absurdly deep trees are not worth honouring
   }
 
+  /* ── integrity ──
+     Web Crypto has no streaming digest, and hashing a file whole would put it
+     back in memory — the exact thing the streaming design avoids. CRC32 is
+     incremental, costs almost nothing, and catches what actually goes wrong
+     here: truncation, reordering, a dropped chunk. It is a corruption check,
+     not a tamper check, and is not relied on for security. */
+
+  const CRC_TABLE = (function () {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[i] = c >>> 0;
+    }
+    return table;
+  })();
+
+  const crcInit = () => 0xFFFFFFFF;
+
+  function crcUpdate(state, bytes) {
+    let c = state >>> 0;
+    for (let i = 0; i < bytes.length; i++) {
+      c = (CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8)) >>> 0;
+    }
+    return c >>> 0;
+  }
+
+  const crcFinal = (state) => ((state ^ 0xFFFFFFFF) >>> 0);
+
+  function crc32(bytes) {
+    return crcFinal(crcUpdate(crcInit(), bytes));
+  }
+
+  // Exponential moving average. A naive total/elapsed rate keeps reporting a
+  // number from thirty seconds ago; this tracks what the link is doing now.
+  function ema(previous, sample, alpha) {
+    if (previous === null || previous === undefined || !isFinite(previous)) return sample;
+    const a = alpha === undefined ? 0.3 : alpha;
+    return previous + a * (sample - previous);
+  }
+
   function eta(doneBytes, totalBytes, elapsedSecs) {
     if (doneBytes <= 0 || elapsedSecs <= 0) return null;
     const rate = doneBytes / elapsedSecs;
@@ -108,7 +149,8 @@ DL.util = (function () {
 
   return {
     PACKED, bytes, duration, newId, shouldCompress, sealSize,
-    chunkSize, throttle, dedupeNames, safeName, safePath, eta,
+    chunkSize, throttle, dedupeNames, safeName, safePath, eta, ema,
+    crc32, crcInit, crcUpdate, crcFinal,
   };
 })();
 

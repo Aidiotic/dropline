@@ -2,6 +2,13 @@ name = "dropline-turn"
 main = "turn-credentials.js"
 compatibility_date = "2026-01-01"
 
+# The workers.dev route is the intended public surface for this endpoint.
+workers_dev = true
+
+# Preview URLs would publish an extra, separately-addressable copy of an
+# endpoint that spends TURN quota. Nothing needs them here.
+preview_urls = false
+
 # Secrets are set with `wrangler secret put`, never committed:
 #   wrangler secret put TURN_KEY_ID
 #   wrangler secret put TURN_API_TOKEN

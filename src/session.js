@@ -21,14 +21,21 @@ DL.session = (function () {
     const base = (cfg.iceServers && cfg.iceServers.length) ? cfg.iceServers.slice() : DEFAULT_ICE.slice();
     if (!cfg.turnCredentialsUrl) return base;
     try {
-      const res = await fetch(cfg.turnCredentialsUrl, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`turn endpoint ${res.status}`);
-      const data = await res.json();
+      // Bounded: this sits in front of every session, so a slow or dead
+      // endpoint must not become a slow or dead app.
+      const res = await fetch(cfg.turnCredentialsUrl, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(cfg.turnTimeoutMs || 4000),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.hint || data.error || `turn endpoint ${res.status}`);
       const extra = data.iceServers || (data.urls ? [data] : []);
+      if (!extra.length) throw new Error('turn endpoint returned no iceServers');
       return base.concat(extra);
     } catch (err) {
-      // A missing relay costs reliability, not correctness — carry on with STUN.
-      console.warn('dropline: TURN unavailable, continuing without a relay', err);
+      // A missing relay costs reliability, not correctness — carry on with
+      // STUN. Roughly 10-20% of network pairs will fail to connect without it.
+      console.warn('dropline: TURN unavailable, continuing with STUN only —', err.message || err);
       return base;
     }
   }
@@ -241,7 +248,7 @@ DL.session = (function () {
         }
 
         case P.T.BEGIN: await beginItem(msg.itemId); break;
-        case P.T.END:   await endItem(msg.itemId); break;
+        case P.T.END:   await endItem(msg.itemId, msg.crc, msg.bytes); break;
 
         case P.T.DONE:
           if (incoming) { emit('batchDone', incoming); incoming = null; }
@@ -276,45 +283,83 @@ DL.session = (function () {
 
       const tick = DL.util.throttle(() => emit('item', { ...item }), 70);
 
+      item.crc = DL.util.crcInit();
+
       let stream = readable;
       if (item.gzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
-      stream = stream.pipeThrough(DL.transfer.meter((n) => {
-        item.done += n;
-        tick();
-        if (inbound.held && inbound.sink && inbound.sink.desiredSize > 0) {
-          inbound.held = false;
-          send(P.go());
-        }
+
+      // Checksum after decompression, so this hashes the same plaintext the
+      // sender hashed before compressing it.
+      stream = stream.pipeThrough(new TransformStream({
+        transform(chunk, ctrl) {
+          item.done += chunk.byteLength;
+          item.crc = DL.util.crcUpdate(item.crc, chunk);
+          tick();
+          if (inbound.held && inbound.sink && inbound.sink.desiredSize > 0) {
+            inbound.held = false;
+            send(P.go());
+          }
+          ctrl.enqueue(chunk);
+        },
       }));
 
       let blob = null;
       const dest = await DL.transfer.sinkFor(incoming.dest, item, (b) => { blob = b; });
       incoming.pipe = stream.pipeTo(dest).then(() => {
-        item.state = 'done';
         item.blob = blob;
         item.elapsed = (Date.now() - item.startedAt) / 1000;
         item.savedToDisk = incoming.dest.kind !== 'seal';
-        emit('item', { ...item });
+        // State is settled in endItem, once the sender's checksum has arrived.
       });
     }
 
-    async function endItem(itemId) {
-      if (!incoming || !incoming.sink) return;
-      try { incoming.sink.close(); } catch { /* already closed */ }
-      incoming.sink = null;
+    async function endItem(itemId, expectedCrc, expectedBytes) {
+      if (!incoming) return;
+      const item = incoming.items.find((i) => i.id === itemId);
+
+      if (incoming.sink) {
+        try { incoming.sink.close(); } catch { /* already closed */ }
+        incoming.sink = null;
+      }
       inbound.sink = null;
       if (inbound.held) { inbound.held = false; send(P.go()); }
-      try { await incoming.pipe; } catch (err) {
-        const item = incoming.items.find((i) => i.id === itemId);
+
+      try {
+        await incoming.pipe;
+      } catch {
         if (item) emit('item', { ...item, state: 'failed', detail: 'Could not write the file.' });
+        return;
       }
+      if (!item) return;
+
+      // The transport is reliable and ordered, so a mismatch means a bug on one
+      // side rather than a lossy link — which is exactly why it is worth
+      // checking. Silent corruption is the one failure nobody notices.
+      const got = DL.util.crcFinal(item.crc);
+      const sizeOk = expectedBytes === undefined || item.done === expectedBytes;
+      const crcOk = expectedCrc === undefined || got === expectedCrc;
+
+      if (crcOk && sizeOk) {
+        item.state = 'done';
+        item.verified = expectedCrc !== undefined;
+      } else {
+        item.state = 'failed';
+        item.detail = sizeOk
+          ? 'Checksum mismatch — the file arrived corrupted.'
+          : `Incomplete — expected ${expectedBytes} bytes, got ${item.done}.`;
+      }
+      emit('item', { ...item });
     }
 
     // Called from a click: the file pickers need a user gesture.
-    async function acceptOffer() {
+    async function acceptOffer(opts) {
       if (!offer) return;
       const files = offer.items.filter((i) => i.kind === 'file');
-      const dest = await DL.transfer.chooseDestination(files);
+      // Auto-accept has no user gesture, so no picker may be opened; those
+      // transfers land via the sealing path and a download link.
+      const dest = (opts && opts.silent)
+        ? { kind: 'seal' }
+        : await DL.transfer.chooseDestination(files);
       if (!dest) return; // cancelled — leave the offer standing
       incoming = { ...offer, dest, sink: null, pipe: null };
       offer = null;
@@ -399,13 +444,13 @@ DL.session = (function () {
           (n) => emit('item', { ...item, dir: 'out', state: 'active', done: n }), 70);
 
         send(P.begin(item.id));
-        const { wire: onWire } = await DL.transfer.pumpFile(conn, entry.file, {
+        const { wire: onWire, crc } = await DL.transfer.pumpFile(conn, entry.file, {
           gzip: entry.gzip,
           flow: gate,
           isLive: live,
           onProgress: tick,
         });
-        send(P.end(item.id));
+        send(P.end(item.id, crc, item.size));
 
         emit('item', {
           ...item, dir: 'out', state: 'done', done: item.size,
