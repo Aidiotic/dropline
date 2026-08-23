@@ -58,6 +58,8 @@ digests on both ends:
 | Corruption caught | One byte flipped in flight → failed with a checksum mismatch, no download offered |
 | Authentication | Both ends showed the same code and reported verified |
 | Striped transfer | 64 MB over 4 channels, SHA-256 matched and CRC verified |
+| Two guests at once | One send reached both; identical digests on each |
+| Resume | 160 MB severed at 3%, reconnected and resumed; digest matched |
 | Multi-file batch | 3 files incl. a nested folder and gzipped text, all matched |
 | Capability probe | 400 MB/s measured; tier and stripe count followed |
 | Settings | Theme, motion, performance and auto-accept persist across reload |

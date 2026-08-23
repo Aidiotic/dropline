@@ -39,17 +39,6 @@
         </p>
       </li>
       <li>
-        <h3>Resume an interrupted transfer</h3>
-        <p>
-          A dropped connection recovers the session, but the file in flight
-          restarts from zero.
-        </p>
-      </li>
-      <li>
-        <h3>More than two devices</h3>
-        <p>A session holds exactly one pair; two recipients means two links.</p>
-      </li>
-      <li>
         <h3>Verify on real iOS and Firefox</h3>
         <p>
           Every automated check runs in one Chromium browser. The Safari and
@@ -62,6 +51,52 @@
 
   <section class="panel">
     <h2 class="sect">Releases</h2>
+
+    <article class="rel">
+      <h3>v1.5 <time datetime="2026-08-23">23 Aug 2026</time></h3>
+      <ul>
+        <li>
+          <strong>More than two devices.</strong> A session used to be one
+          connection, with every piece of per-connection state living directly
+          in it. That state is now a link, and a session holds as many as eight:
+          sends go to every attached device, offers and transfers say which
+          device they came from, and two peers sending the same filename get
+          their own rows instead of overwriting each other.
+        </li>
+        <li>
+          <strong>An interrupted transfer resumes instead of restarting.</strong>
+          The receiver keeps what it has committed and marks the file paused
+          rather than failed; the sender holds it, and once reconnected asks how
+          far the receiver got and carries on from there. Verified by severing a
+          160 MB transfer at 3% — it reconnected, resumed, and the finished file
+          matched the original checksum exactly.
+        </li>
+        <li>
+          A returning device is recognised by a stable per-browser id, because
+          the signalling broker issues a fresh peer id on every connection and
+          the host would otherwise see a stranger and start over.
+        </li>
+        <li>
+          The checksum still covers the whole file. A resumed send re-reads the
+          part it is <em>not</em> transmitting rather than taking the receiver's
+          word for it — disk work, no network, and verification stays genuinely
+          end to end.
+        </li>
+      </ul>
+      <p class="credit">
+        Four bugs stood between this working and appearing to work, and each hid
+        the next. A sender parked waiting for a dead channel to drain never
+        failed, so nothing ever noticed the interruption. A rejoining device
+        left its temporary link's listeners attached, so two links answered
+        every message and the one holding the paused file never restarted. That
+        temporary link also issued its own authentication challenge, so a
+        correct answer to the wrong question read as an impostor and closed a
+        healthy connection. And underneath all of it, the two ends were free to
+        choose different numbers of channels to stripe across — a sender using
+        four while the receiver listened on three lost every chunk on the
+        fourth, silently, while reporting 155 MB sent.
+      </p>
+    </article>
 
     <article class="rel">
       <h3>v1.4 <time datetime="2026-08-23">23 Aug 2026</time></h3>

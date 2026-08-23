@@ -15,7 +15,9 @@ to pay for, and nothing to delete afterwards.
 - **Streams to disk.** Nothing is held in memory, so file size is not bounded by
   RAM.
 - **Compresses in flight** when a measurement says it will actually help.
-- **Reconnects** if the connection drops or a phone locks.
+- **Reconnects and resumes** — a dropped connection picks the file back up
+  where it stopped rather than starting again.
+- **Several devices at once**, up to eight; a send goes to all of them.
 - **Verifies both ends** hold the same link, and checksums every file.
 - **Adapts to the device** rather than assuming a fast desktop — five tiers,
   chosen partly by measuring what the machine actually does.
@@ -33,8 +35,9 @@ or a strict corporate firewall. A TURN relay fixes this and the client is
 already wired for one; see [DEPLOYING.md](DEPLOYING.md). Without a relay, those
 transfers fail to connect at all.
 
-An interrupted transfer restarts the file rather than resuming from where it
-stopped.
+An interrupted transfer resumes where it stopped, but only while the page stays
+open — a reload loses the handle to the file being sent, which the browser will
+not hand back without picking it again.
 
 ## How it moves bytes
 
@@ -102,6 +105,10 @@ names, `..` segments are dropped from paths, depth is capped, and colliding
 names are disambiguated rather than silently overwriting each other. A peer
 cannot write outside the folder you picked.
 
+Both ends must stripe across the same number of channels, since ordering is
+rebuilt from *chunk i went to channel i mod N*. Each proposes a count from its
+own device tier and both take the lower of the two.
+
 **The link carries a secret**, after the `~`. URL fragments are never sent to a
 server, so the signalling broker learns the session id and nothing else — it
 cannot impersonate either side. Both peers prove they hold the secret via a
@@ -146,7 +153,7 @@ WebRTC and the clipboard API need a secure context, so use the `localhost` URL
 | `src/stripe.js` | Parallel data channels and header-free reordering |
 | `src/protocol.js` | Wire messages, manifest building, untrusted-input parsing |
 | `src/transfer.js` | Stream plumbing: chunked send, sealing, destinations |
-| `src/session.js` | Peer lifecycle, reconnection, routing, send/receive machines |
+| `src/session.js` | Peer lifecycle, links, reconnection, resume, send/receive |
 | `src/ui.js` | The only file that touches the DOM |
 | `config.js` | Runtime config — not bundled, editable on a live deploy |
 | `worker/` | Cloudflare Worker that mints short-lived TURN credentials |
