@@ -15,8 +15,15 @@ DL.transfer = (function () {
 
   // Blob bytes live outside the JS heap and the browser spills them to disk,
   // so sealing periodically keeps the heap flat however large the file is.
-  function sealingSink(mime, onFinished) {
-    const sealed = [];
+  // Blob bytes live outside the JS heap and the browser spills them to disk,
+  // so sealing periodically keeps the heap flat however large the file is.
+  //
+  // The sealed parts hang off the item rather than off this closure, because a
+  // transfer interrupted half way must be able to resume onto the end of what
+  // it already has rather than discarding it.
+  function sealingSink(item) {
+    if (!item.parts) item.parts = [];
+    const sealed = item.parts;
     const limit = DL.device.profile.seal;
     let pending = [];
     let bytesPending = 0;
@@ -34,12 +41,17 @@ DL.transfer = (function () {
         bytesPending += chunk.byteLength;
         if (bytesPending >= limit) seal();
       },
-      close() {
-        seal();
-        onFinished(new Blob(sealed, { type: mime || 'application/octet-stream' }));
-      },
-      abort() { pending = []; sealed.length = 0; },
+      // Closed on a dropped connection as well as on completion, so whatever
+      // arrived is retained either way.
+      close() { seal(); },
+      abort() { seal(); },
     });
+  }
+
+  // Called once the item is verified complete.
+  function finishBlob(item) {
+    if (!item.parts) return null;
+    return new Blob(item.parts, { type: item.mime || 'application/octet-stream' });
   }
 
   // PeerJS hands binary back as ArrayBuffer, Blob or a view depending on
@@ -94,6 +106,7 @@ DL.transfer = (function () {
 
   async function pumpFile(file, opts) {
     const size = opts.chunkSize;
+    const from = opts.from || 0;   // plaintext offset to resume at
 
     let wire = 0;
     let crc = DL.util.crcInit();
@@ -111,9 +124,19 @@ DL.transfer = (function () {
     // and network overlap instead of taking turns.
     if (!opts.gzip) {
       const readAt = (off) => file.slice(off, Math.min(off + size, file.size)).arrayBuffer();
-      let next = file.size ? readAt(0) : null;
 
-      for (let off = 0; off < file.size; off += size) {
+      // The checksum covers the whole file, so a resumed transfer still has to
+      // account for the prefix it is not sending. Reading it costs disk but no
+      // network, and keeps the verification genuinely end to end rather than
+      // trusting the receiver's word for the part it already holds.
+      for (let off = 0; off < from; off += size) {
+        const skip = await readAt(off);
+        crc = DL.util.crcUpdate(crc, new Uint8Array(skip));
+      }
+
+      let next = from < file.size ? readAt(from) : null;
+
+      for (let off = from; off < file.size; off += size) {
         const buf = await next;
         const following = off + size;
         next = following < file.size ? readAt(following) : null;
@@ -130,8 +153,19 @@ DL.transfer = (function () {
     }
 
     // ── compressed: the gzip stream decides its own chunk boundaries ──
-    let read = 0;
-    let stream = file.stream().pipeThrough(new TransformStream({
+    // A resumed segment is compressed as its own gzip stream; the receiver
+    // decompresses it separately and appends the result.
+    //
+    // As on the uncompressed path, the checksum covers the whole plaintext, so
+    // the prefix that is not being resent still has to be read and hashed.
+    for (let off = 0; off < from; off += size) {
+      const skip = await file.slice(off, Math.min(off + size, from)).arrayBuffer();
+      crc = DL.util.crcUpdate(crc, new Uint8Array(skip));
+    }
+
+    let read = from;
+    const source = from ? file.slice(from) : file;
+    let stream = source.stream().pipeThrough(new TransformStream({
       transform(chunk, ctrl) {
         read += chunk.byteLength;
         crc = DL.util.crcUpdate(crc, chunk);        // hash the plaintext
@@ -204,26 +238,37 @@ DL.transfer = (function () {
     return { kind: 'seal' }; // no picker, or it failed for a reason other than cancel
   }
 
-  async function sinkFor(dest, item, onBlob) {
+  async function sinkFor(dest, item, resuming) {
     try {
-      if (dest.kind === 'file') return await dest.handle.createWritable();
-      if (dest.kind === 'dir') {
-        let folder = dest.dir;
-        for (const segment of (item.path || [])) {
-          folder = await folder.getDirectoryHandle(segment, { create: true });
+      if (dest.kind === 'file' || dest.kind === 'dir') {
+        let handle = item.handle;
+        if (!handle) {
+          if (dest.kind === 'file') {
+            handle = dest.handle;
+          } else {
+            let folder = dest.dir;
+            for (const segment of (item.path || [])) {
+              folder = await folder.getDirectoryHandle(segment, { create: true });
+            }
+            handle = await folder.getFileHandle(item.name, { create: true });
+          }
+          item.handle = handle;
         }
-        const fh = await folder.getFileHandle(item.name, { create: true });
-        return await fh.createWritable();
+        // Resuming must not truncate what is already on disk, and must land at
+        // the offset the receiver reported rather than back at the start.
+        const writable = await handle.createWritable({ keepExistingData: !!resuming });
+        if (resuming && item.done) await writable.seek(item.done);
+        return writable;
       }
     } catch {
       // lost permission, or the name was rejected — fall back rather than fail
     }
-    return sealingSink(item.mime, onBlob);
+    return sealingSink(item);
   }
 
   return {
     HAS_SAVE, HAS_DIR, HAS_GZIP,
-    meter, sealingSink, toBytes, drain, pumpFile, chooseDestination, sinkFor,
-    shouldCompress,
+    meter, sealingSink, finishBlob, toBytes, drain, pumpFile, chooseDestination,
+    sinkFor, shouldCompress,
   };
 })();

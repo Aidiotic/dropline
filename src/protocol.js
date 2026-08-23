@@ -15,6 +15,8 @@ DL.protocol = (function () {
     DECLINE:  'decline',
     BEGIN:    'begin',     // payload after this belongs to itemId
     BEGIN_ACK: 'beginack', // receiver is listening; safe to stream
+    RESUME:    'resume',   // where had you got to with this item?
+    RESUME_AT: 'resumeat',
     END:      'end',
     TEXT:     'text',      // small payload carried inline, no binary frames
     DONE:     'done',
@@ -25,8 +27,10 @@ DL.protocol = (function () {
     BYE:      'bye',
   };
 
-  function hello(name, stripes) {
-    return JSON.stringify({ t: T.HELLO, v: VERSION, name, stripes });
+  // `client` is a stable per-browser id, so a host can tell a returning device
+  // from a new one -- PeerJS hands guests a fresh peer id on every connection.
+  function hello(name, stripes, client) {
+    return JSON.stringify({ t: T.HELLO, v: VERSION, name, stripes, client });
   }
 
   // `entries` are {name, size, mime, kind}. Names are made unique and stripped
@@ -48,8 +52,12 @@ DL.protocol = (function () {
 
   const accept  = (batchId) => JSON.stringify({ t: T.ACCEPT, batchId });
   const decline = (batchId, reason) => JSON.stringify({ t: T.DECLINE, batchId, reason });
-  const begin    = (itemId) => JSON.stringify({ t: T.BEGIN, itemId });
+  // `at` is a byte offset into the plaintext: zero for a fresh item, and the
+  // receiver's committed length when picking a transfer back up.
+  const begin    = (itemId, at) => JSON.stringify({ t: T.BEGIN, itemId, at: at || 0 });
   const beginAck = (itemId) => JSON.stringify({ t: T.BEGIN_ACK, itemId });
+  const resume   = (itemId) => JSON.stringify({ t: T.RESUME, itemId });
+  const resumeAt = (itemId, at, crc) => JSON.stringify({ t: T.RESUME_AT, itemId, at, crc });
   const end     = (itemId, crc, bytes, chunks) => JSON.stringify({ t: T.END, itemId, crc, bytes, chunks });
   const done    = (batchId) => JSON.stringify({ t: T.DONE, batchId });
   const hold    = () => JSON.stringify({ t: T.HOLD });
@@ -79,6 +87,10 @@ DL.protocol = (function () {
       }));
     }
     if (msg.t === T.TEXT && typeof msg.body !== 'string') return null;
+    if (msg.t === T.BEGIN || msg.t === T.RESUME_AT) {
+      msg.at = Math.max(0, Number(msg.at) || 0);
+    }
+    if (msg.t === T.HELLO && typeof msg.client !== 'string') msg.client = null;
     return msg;
   }
 
@@ -87,7 +99,7 @@ DL.protocol = (function () {
 
   return {
     VERSION, T, hello, manifest, accept, decline, begin, beginAck, end, done,
-    hold, go, bye, auth, proof, text, parse, totalBytes,
+    hold, go, bye, auth, proof, text, resume, resumeAt, parse, totalBytes,
   };
 })();
 

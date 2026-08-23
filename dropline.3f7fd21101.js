@@ -497,6 +497,8 @@ DL.protocol = (function () {
     DECLINE:  'decline',
     BEGIN:    'begin',     // payload after this belongs to itemId
     BEGIN_ACK: 'beginack', // receiver is listening; safe to stream
+    RESUME:    'resume',   // where had you got to with this item?
+    RESUME_AT: 'resumeat',
     END:      'end',
     TEXT:     'text',      // small payload carried inline, no binary frames
     DONE:     'done',
@@ -507,8 +509,10 @@ DL.protocol = (function () {
     BYE:      'bye',
   };
 
-  function hello(name, stripes) {
-    return JSON.stringify({ t: T.HELLO, v: VERSION, name, stripes });
+  // `client` is a stable per-browser id, so a host can tell a returning device
+  // from a new one -- PeerJS hands guests a fresh peer id on every connection.
+  function hello(name, stripes, client) {
+    return JSON.stringify({ t: T.HELLO, v: VERSION, name, stripes, client });
   }
 
   // `entries` are {name, size, mime, kind}. Names are made unique and stripped
@@ -530,8 +534,12 @@ DL.protocol = (function () {
 
   const accept  = (batchId) => JSON.stringify({ t: T.ACCEPT, batchId });
   const decline = (batchId, reason) => JSON.stringify({ t: T.DECLINE, batchId, reason });
-  const begin    = (itemId) => JSON.stringify({ t: T.BEGIN, itemId });
+  // `at` is a byte offset into the plaintext: zero for a fresh item, and the
+  // receiver's committed length when picking a transfer back up.
+  const begin    = (itemId, at) => JSON.stringify({ t: T.BEGIN, itemId, at: at || 0 });
   const beginAck = (itemId) => JSON.stringify({ t: T.BEGIN_ACK, itemId });
+  const resume   = (itemId) => JSON.stringify({ t: T.RESUME, itemId });
+  const resumeAt = (itemId, at, crc) => JSON.stringify({ t: T.RESUME_AT, itemId, at, crc });
   const end     = (itemId, crc, bytes, chunks) => JSON.stringify({ t: T.END, itemId, crc, bytes, chunks });
   const done    = (batchId) => JSON.stringify({ t: T.DONE, batchId });
   const hold    = () => JSON.stringify({ t: T.HOLD });
@@ -561,6 +569,10 @@ DL.protocol = (function () {
       }));
     }
     if (msg.t === T.TEXT && typeof msg.body !== 'string') return null;
+    if (msg.t === T.BEGIN || msg.t === T.RESUME_AT) {
+      msg.at = Math.max(0, Number(msg.at) || 0);
+    }
+    if (msg.t === T.HELLO && typeof msg.client !== 'string') msg.client = null;
     return msg;
   }
 
@@ -569,7 +581,7 @@ DL.protocol = (function () {
 
   return {
     VERSION, T, hello, manifest, accept, decline, begin, beginAck, end, done,
-    hold, go, bye, auth, proof, text, parse, totalBytes,
+    hold, go, bye, auth, proof, text, resume, resumeAt, parse, totalBytes,
   };
 })();
 
@@ -774,8 +786,15 @@ DL.transfer = (function () {
 
   // Blob bytes live outside the JS heap and the browser spills them to disk,
   // so sealing periodically keeps the heap flat however large the file is.
-  function sealingSink(mime, onFinished) {
-    const sealed = [];
+  // Blob bytes live outside the JS heap and the browser spills them to disk,
+  // so sealing periodically keeps the heap flat however large the file is.
+  //
+  // The sealed parts hang off the item rather than off this closure, because a
+  // transfer interrupted half way must be able to resume onto the end of what
+  // it already has rather than discarding it.
+  function sealingSink(item) {
+    if (!item.parts) item.parts = [];
+    const sealed = item.parts;
     const limit = DL.device.profile.seal;
     let pending = [];
     let bytesPending = 0;
@@ -793,12 +812,17 @@ DL.transfer = (function () {
         bytesPending += chunk.byteLength;
         if (bytesPending >= limit) seal();
       },
-      close() {
-        seal();
-        onFinished(new Blob(sealed, { type: mime || 'application/octet-stream' }));
-      },
-      abort() { pending = []; sealed.length = 0; },
+      // Closed on a dropped connection as well as on completion, so whatever
+      // arrived is retained either way.
+      close() { seal(); },
+      abort() { seal(); },
     });
+  }
+
+  // Called once the item is verified complete.
+  function finishBlob(item) {
+    if (!item.parts) return null;
+    return new Blob(item.parts, { type: item.mime || 'application/octet-stream' });
   }
 
   // PeerJS hands binary back as ArrayBuffer, Blob or a view depending on
@@ -853,6 +877,7 @@ DL.transfer = (function () {
 
   async function pumpFile(file, opts) {
     const size = opts.chunkSize;
+    const from = opts.from || 0;   // plaintext offset to resume at
 
     let wire = 0;
     let crc = DL.util.crcInit();
@@ -870,9 +895,19 @@ DL.transfer = (function () {
     // and network overlap instead of taking turns.
     if (!opts.gzip) {
       const readAt = (off) => file.slice(off, Math.min(off + size, file.size)).arrayBuffer();
-      let next = file.size ? readAt(0) : null;
 
-      for (let off = 0; off < file.size; off += size) {
+      // The checksum covers the whole file, so a resumed transfer still has to
+      // account for the prefix it is not sending. Reading it costs disk but no
+      // network, and keeps the verification genuinely end to end rather than
+      // trusting the receiver's word for the part it already holds.
+      for (let off = 0; off < from; off += size) {
+        const skip = await readAt(off);
+        crc = DL.util.crcUpdate(crc, new Uint8Array(skip));
+      }
+
+      let next = from < file.size ? readAt(from) : null;
+
+      for (let off = from; off < file.size; off += size) {
         const buf = await next;
         const following = off + size;
         next = following < file.size ? readAt(following) : null;
@@ -889,8 +924,19 @@ DL.transfer = (function () {
     }
 
     // ── compressed: the gzip stream decides its own chunk boundaries ──
-    let read = 0;
-    let stream = file.stream().pipeThrough(new TransformStream({
+    // A resumed segment is compressed as its own gzip stream; the receiver
+    // decompresses it separately and appends the result.
+    //
+    // As on the uncompressed path, the checksum covers the whole plaintext, so
+    // the prefix that is not being resent still has to be read and hashed.
+    for (let off = 0; off < from; off += size) {
+      const skip = await file.slice(off, Math.min(off + size, from)).arrayBuffer();
+      crc = DL.util.crcUpdate(crc, new Uint8Array(skip));
+    }
+
+    let read = from;
+    const source = from ? file.slice(from) : file;
+    let stream = source.stream().pipeThrough(new TransformStream({
       transform(chunk, ctrl) {
         read += chunk.byteLength;
         crc = DL.util.crcUpdate(crc, chunk);        // hash the plaintext
@@ -963,42 +1009,60 @@ DL.transfer = (function () {
     return { kind: 'seal' }; // no picker, or it failed for a reason other than cancel
   }
 
-  async function sinkFor(dest, item, onBlob) {
+  async function sinkFor(dest, item, resuming) {
     try {
-      if (dest.kind === 'file') return await dest.handle.createWritable();
-      if (dest.kind === 'dir') {
-        let folder = dest.dir;
-        for (const segment of (item.path || [])) {
-          folder = await folder.getDirectoryHandle(segment, { create: true });
+      if (dest.kind === 'file' || dest.kind === 'dir') {
+        let handle = item.handle;
+        if (!handle) {
+          if (dest.kind === 'file') {
+            handle = dest.handle;
+          } else {
+            let folder = dest.dir;
+            for (const segment of (item.path || [])) {
+              folder = await folder.getDirectoryHandle(segment, { create: true });
+            }
+            handle = await folder.getFileHandle(item.name, { create: true });
+          }
+          item.handle = handle;
         }
-        const fh = await folder.getFileHandle(item.name, { create: true });
-        return await fh.createWritable();
+        // Resuming must not truncate what is already on disk, and must land at
+        // the offset the receiver reported rather than back at the start.
+        const writable = await handle.createWritable({ keepExistingData: !!resuming });
+        if (resuming && item.done) await writable.seek(item.done);
+        return writable;
       }
     } catch {
       // lost permission, or the name was rejected — fall back rather than fail
     }
-    return sealingSink(item.mime, onBlob);
+    return sealingSink(item);
   }
 
   return {
     HAS_SAVE, HAS_DIR, HAS_GZIP,
-    meter, sealingSink, toBytes, drain, pumpFile, chooseDestination, sinkFor,
-    shouldCompress,
+    meter, sealingSink, finishBlob, toBytes, drain, pumpFile, chooseDestination,
+    sinkFor, shouldCompress,
   };
 })();
 
 
 /* ── src/session.js ── */
 /* Session: peer lifecycle, reconnection, message routing, and the send/receive
-   state machines. Symmetric — either peer may offer a batch at any time. */
+   state machines.
+
+   A session owns one signalling peer and any number of links. A link is one
+   connection to one other device, and holds everything that is per-connection:
+   its own gate, stripes, queues, offer and incoming batch. The host may hold
+   several at once; a guest holds exactly one.
+
+   Every link is symmetric — either end may offer a batch at any time. */
 
 var DL = (typeof DL !== 'undefined') ? DL : {};
 
 DL.session = (function () {
   const P = DL.protocol;
   const ID_PREFIX = 'dropline-';
-
   const RETRY_DELAYS = [800, 1600, 3200, 6000, 10000];
+  const MAX_PEERS = 8;
 
   const DEFAULT_ICE = [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -1067,12 +1131,27 @@ DL.session = (function () {
     return out;
   }
 
+  // A stable identity for this browser, so a host can recognise a returning
+  // guest across a dropped connection -- PeerJS hands guests a fresh random id
+  // every time, which would otherwise look like a different device.
+  function clientId() {
+    try {
+      const found = sessionStorage.getItem('dropline-client');
+      if (found) return found;
+      const made = Array.from(rand(8), (b) => b.toString(16).padStart(2, '0')).join('');
+      sessionStorage.setItem('dropline-client', made);
+      return made;
+    } catch {
+      return Array.from(rand(8), (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  }
+
   // A small ring of recent protocol events. Costs nothing, and turns "it
   // didn't connect" into something answerable without a redeploy.
   const trace = [];
   function note(event, detail) {
     trace.push({ t: Date.now(), event, ...detail });
-    if (trace.length > 120) trace.shift();
+    if (trace.length > 160) trace.shift();
   }
 
   function create(options) {
@@ -1080,55 +1159,26 @@ DL.session = (function () {
     const isHost = options.role === 'host';
     const hostId = isHost ? newSessionId() : options.hostId;
     const secret = isHost ? newSecret() : (options.secret || null);
-
-    // With no secret in the link (an older link, or one hand-edited) the
-    // session still works but cannot be authenticated. Say so rather than
-    // implying a guarantee that is not there.
-    let authed = !secret;
-    let myNonce = null;
+    const me = clientId();
 
     let peer = null;
-    let conn = null;
     let closed = false;
     let retry = 0;
-    let helloSeen = false;
 
-    // Outbound gate, driven by the far end's hold/go.
-    const gate = {
-      held: false,
-      waiter: null,
-      hold() { this.held = true; },
-      release() {
-        this.held = false;
-        if (this.waiter) { const w = this.waiter; this.waiter = null; w(); }
-      },
-      async wait() {
-        while (this.held && !closed) {
-          await new Promise((resolve) => { this.waiter = resolve; });
-        }
-      },
-    };
-
-    // Inbound backpressure bookkeeping.
-    const inbound = { held: false, sink: null };
-
-    // Striped payload transport; null until the extra channels are open, and
-    // everything falls back to the single control channel if they never are.
-    let stripeWriter = null;
-    let stripeReader = null;
-    let stripeCount = 0;
-    let beginAckWaiter = null;
-
-    const outQueue = [];
-    let sending = false;
-
-    let offer = null;   // batch awaiting the user's decision
-    let incoming = null; // batch being received
+    const links = new Map();   // linkId -> link
+    let nextLabel = 1;
 
     const emit = (name, ...args) => { if (on[name]) on[name](...args); };
-    const live = () => !!conn && conn.open && !closed;
+    const peerCount = () => [...links.values()].filter((l) => l.live()).length;
 
-    /* ── connection lifecycle ── */
+    function announceTopology() {
+      emit('peers', {
+        count: peerCount(),
+        labels: [...links.values()].filter((l) => l.live()).map((l) => l.label),
+      });
+    }
+
+    /* ── signalling ── */
 
     async function start() {
       const ice = await iceServers();
@@ -1147,7 +1197,11 @@ DL.session = (function () {
 
       peer.on('connection', (incomingConn) => {
         if (!isHost) return;
-        if (conn && conn.open) { incomingConn.on('open', () => incomingConn.close()); return; }
+        if (peerCount() >= MAX_PEERS) {
+          note('rejected-full');
+          incomingConn.on('open', () => incomingConn.close());
+          return;
+        }
         adopt(incomingConn);
       });
 
@@ -1191,499 +1245,673 @@ DL.session = (function () {
       setTimeout(() => { if (!closed) dial(); }, wait);
     }
 
-    function adopt(c) {
-      conn = c;
-      let chain = Promise.resolve();
+    // A connection arriving from a client we already know is that client
+    // reconnecting; reuse its link so partly-transferred files survive.
+    function adopt(conn) {
+      const link = createLink(conn);
+      links.set(link.id, link);
+      link.attach(conn);
+    }
+
+    function rekey(link, remoteClient) {
+      if (!remoteClient) return;
+      const existing = [...links.values()].find(
+        (l) => l !== link && l.remoteClient === remoteClient);
+      if (existing) {
+        note('rejoin', { label: existing.label });
+        existing.adoptFrom(link);       // hand the fresh connection to the old link
+        links.delete(link.id);
+        return existing;
+      }
+      link.remoteClient = remoteClient;
+      return link;
+    }
+
+    /* ── one connection ── */
+
+    function createLink(initialConn) {
+      const link = {
+        id: `L${nextLabel}`,
+        label: isHost ? `device ${nextLabel}` : 'host',
+        remoteClient: null,
+      };
+      nextLabel++;
+
+      let conn = initialConn;
+      let authed = !secret;
+      let myNonce = null;
+      let helloSeen = false;
       let handshakeDone = false;
-      shieldWhenReady(c);
 
-      c.on('open', async () => {
-        note('open', { role: isHost ? 'host' : 'guest', repeat: handshakeDone });
-        if (handshakeDone) { flushOutbox(); return; }   // never redo the handshake
-        handshakeDone = true;
-        retry = 0;
-        helloSeen = false;
-        authed = !secret;
-        gate.release();
-        c.send(P.hello(options.name || 'someone', DL.stripe.countFor()));
-
-        if (secret) {
-          myNonce = newSecret();
-          c.send(P.auth(myNonce));
-          emit('code', await shortCode(secret));
-        }
-
-        setupStripes(c);
-
-        flushOutbox();
-        emit('status', 'connected');
-        describeLink().then((link) => { if (link) emit('link-quality', link); });
-        setTimeout(() => describeLink().then((l) => { if (l) emit('link-quality', l); }), 2500);
-        pump(); // anything queued while disconnected
-      });
-
-      // Serialised: converting a Blob is async, and overlapping handlers would
-      // enqueue chunks out of order and silently corrupt a file.
-      c.on('data', (data) => {
-        chain = chain.then(() => route(data)).catch((err) => {
-          emit('error', `Transfer failed: ${err && err.message ? err.message : err}`);
-        });
-      });
-
-      c.on('close', () => {
-        note('close');
-        if (closed) return;
-        failActiveTransfers('The connection dropped.');
-        conn = null;
-        gate.release();
-        if (isHost) emit('status', 'waiting');
-        else scheduleRetry();
-      });
-
-      c.on('error', () => { /* close follows; handled there */ });
-    }
-
-    // PeerJS's negotiator installs pc.ondatachannel and treats whatever
-    // arrives as *its* connection's channel, re-initialising the
-    // DataConnection and re-firing 'open'. Our stripe channels would each
-    // trigger that, which both restarts the handshake and hands PeerJS the
-    // wrong channel to send control messages on. Keep ours away from it;
-    // addEventListener listeners still fire, so collection is unaffected.
-    function shieldPeerJs(c) {
-      const pc = c && c.peerConnection;
-      if (!pc || pc.__droplineShielded) return !!pc;
-      pc.__droplineShielded = true;
-
-      // Capture whatever PeerJS has already installed, then take ownership of
-      // the property so later assignments land in `inner` instead of the
-      // platform's handler slot. The wrapper is registered explicitly, because
-      // once the accessor is overridden the platform no longer dispatches to
-      // the on-property itself.
-      let inner = pc.ondatachannel;
-      // Clearing through the native setter first is what actually matters:
-      // defineProperty only rebinds the JS-visible property, while the handler
-      // PeerJS already assigned lives in the platform's internal slot and
-      // would keep being dispatched.
-      pc.ondatachannel = null;
-      const wrapper = (ev) => {
-        const label = ev && ev.channel && ev.channel.label;
-        if (label && label.startsWith(DL.stripe.LABEL)) return;   // ours, not PeerJS's
-        if (typeof inner === 'function') inner.call(pc, ev);
-      };
-
-      Object.defineProperty(pc, 'ondatachannel', {
-        configurable: true,
-        get() { return inner; },
-        set(fn) { inner = fn; },
-      });
-      pc.addEventListener('datachannel', wrapper);
-      return true;
-    }
-
-    // peerConnection may not exist the instant a connection is created, and
-    // the shield has to be in place before any stripe channel arrives.
-    function shieldWhenReady(c) {
-      if (shieldPeerJs(c)) return;
-      let tries = 0;
-      const timer = setInterval(() => {
-        if (shieldPeerJs(c) || ++tries > 40) clearInterval(timer);
-      }, 25);
-    }
-
-    // One side creates the channels and the other adopts them; both may then
-    // send, since a data channel is duplex. Failure here is not fatal -- the
-    // transfer simply runs on the control channel as before.
-    function setupStripes(c) {
-      const pc = c.peerConnection;
-      if (!pc) return;
-      shieldPeerJs(c);
-      stripeCount = DL.stripe.countFor();
-
-      const attach = (channels) => {
-        if (!channels) return;
-        stripeWriter = DL.stripe.writer(channels, { high: 2 * 1024 * 1024 });
-        stripeReader = DL.stripe.reader(channels, (chunk) => {
-          if (incoming && incoming.sink) incoming.sink.enqueue(chunk);
-        });
-        emit('transport', { stripes: channels.length });
-      };
-
-      if (isHost) {
-        DL.stripe.create(pc, stripeCount)
-          .then(attach)
-          .catch(() => { stripeCount = 0; });
-      } else {
-        DL.stripe.collect(pc, stripeCount, attach);
-      }
-    }
-
-    function failActiveTransfers(reason) {
-      if (incoming) {
-        try { incoming.sink && incoming.sink.error(new Error(reason)); } catch { /* already gone */ }
-        incoming.items.forEach((it) => {
-          if (it.state === 'active') emit('item', { ...it, state: 'failed', detail: reason });
-        });
-        incoming = null;
-      }
-      sending = false;
-    }
-
-    async function describeLink() {
-      try {
-        const pc = conn && conn.peerConnection;
-        if (!pc || !pc.getStats) return null;
-        const stats = await pc.getStats();
-        let pair = null;
-        stats.forEach((r) => {
-          if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r;
-        });
-        if (!pair) return null;
-        let local = null;
-        let remote = null;
-        stats.forEach((r) => {
-          if (r.id === pair.localCandidateId) local = r;
-          if (r.id === pair.remoteCandidateId) remote = r;
-        });
-        const relayed = (local && local.candidateType === 'relay')
-          || (remote && remote.candidateType === 'relay');
-        return {
-          relayed: !!relayed,
-          rtt: typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime : null,
-          localType: local ? local.candidateType : null,
-          remoteType: remote ? remote.candidateType : null,
-        };
-      } catch {
-        return null;
-      }
-    }
-
-    /* ── inbound ── */
-
-    async function route(raw) {
-      if (typeof raw !== 'string') {
-        if (!incoming || !incoming.sink) return;
-        const view = await DL.transfer.toBytes(raw);
-        if (!view) return;
-        incoming.sink.enqueue(view);
-        if (!inbound.held && incoming.sink.desiredSize !== null && incoming.sink.desiredSize <= 0) {
-          inbound.held = true;
-          send(P.hold());
-        }
-        return;
-      }
-
-      const msg = P.parse(raw);
-      if (!msg) { note('rx-unparsed'); return; }
-      note('rx', { type: msg.t });
-
-      switch (msg.t) {
-        case P.T.HELLO:
-          helloSeen = true;
-          emit('peer', { name: msg.name, version: msg.v });
-          break;
-
-        case P.T.AUTH:
-          if (secret && typeof msg.nonce === 'string') {
-            send(P.proof(await digest(`${secret}:${msg.nonce}`)));
-          }
-          break;
-
-        case P.T.PROOF: {
-          // Ignore anything we did not ask for: a late reply from a previous
-          // connection is not an impostor, and tearing the session down for
-          // one would be worse than the problem.
-          if (!secret || !myNonce) break;
-          const want = await digest(`${secret}:${myNonce}`);
-          myNonce = null;
-          if (msg.value === want) {
-            note('auth-ok');
-            authed = true;
-            emit('authenticated', true);
-          } else {
-            note('auth-mismatch', { got: String(msg.value).slice(0, 8), want: want.slice(0, 8) });
-            emit('error', 'The other device could not prove it holds this link.');
-            close();
-          }
-          break;
-        }
-
-        case P.T.HOLD: gate.hold(); break;
-        case P.T.GO:   gate.release(); break;
-
-        case P.T.MANIFEST:
-          if (!authed) { send(P.decline(msg.batchId, 'unauthenticated')); break; }
-          offer = {
-            batchId: msg.batchId,
-            items: msg.items.map((it) => ({ ...it, dir: 'in', state: 'offered', done: 0 })),
-          };
-          emit('offer', offer);
-          break;
-
-        case P.T.ACCEPT:
-          if (pendingOut && pendingOut.batchId === msg.batchId) {
-            pendingOut.resolve(true);
-            pendingOut = null;
-          }
-          break;
-
-        case P.T.DECLINE:
-          if (pendingOut && pendingOut.batchId === msg.batchId) {
-            pendingOut.resolve(false);
-            pendingOut = null;
-          }
-          break;
-
-        case P.T.TEXT: {
-          const item = incoming && incoming.items.find((i) => i.id === msg.itemId);
-          const name = item ? item.name : 'Text';
-          emit('item', { id: msg.itemId, dir: 'in', kind: 'text', name, body: msg.body, state: 'done', size: msg.body.length });
-          break;
-        }
-
-        case P.T.BEGIN:
-          await beginItem(msg.itemId);
-          send(P.beginAck(msg.itemId));   // control and payload are separate
-          break;                          // channels; never assume an order
-
-        case P.T.BEGIN_ACK:
-          if (beginAckWaiter) { const w = beginAckWaiter; beginAckWaiter = null; w(); }
-          break;
-        case P.T.END:   await endItem(msg.itemId, msg.crc, msg.bytes, msg.chunks); break;
-
-        case P.T.DONE:
-          if (incoming) { emit('batchDone', incoming); incoming = null; }
-          break;
-
-        case P.T.BYE:
-          emit('status', 'closed');
-          break;
-
-        default: break;
-      }
-    }
-
-    async function beginItem(itemId) {
-      if (!incoming) return;
-      const item = incoming.items.find((i) => i.id === itemId);
-      if (!item) return;
-
-      incoming.current = item;
-      item.state = 'active';
-      item.startedAt = Date.now();
-      emit('item', { ...item });
-
-      let sink = null;
-      const readable = new ReadableStream(
-        { start(c) { sink = c; } },
-        new ByteLengthQueuingStrategy({ highWaterMark: DL.device.profile.watermark }),
-      );
-      incoming.sink = sink;
-      inbound.sink = sink;
-      inbound.held = false;
-      if (stripeReader) stripeReader.reset();
-
-      const tick = DL.util.throttle(() => emit('item', { ...item }), DL.device.profile.repaintMs);
-
-      item.crc = DL.util.crcInit();
-
-      let stream = readable;
-      if (item.gzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
-
-      // Checksum after decompression, so this hashes the same plaintext the
-      // sender hashed before compressing it.
-      stream = stream.pipeThrough(new TransformStream({
-        transform(chunk, ctrl) {
-          item.done += chunk.byteLength;
-          item.crc = DL.util.crcUpdate(item.crc, chunk);
-          tick();
-          if (inbound.held && inbound.sink && inbound.sink.desiredSize > 0) {
-            inbound.held = false;
-            send(P.go());
-          }
-          ctrl.enqueue(chunk);
+      // Outbound gate, driven by the far end's hold/go.
+      const gate = {
+        held: false,
+        waiter: null,
+        hold() { this.held = true; },
+        release() {
+          this.held = false;
+          if (this.waiter) { const w = this.waiter; this.waiter = null; w(); }
         },
-      }));
+        async wait() {
+          while (this.held && !closed) {
+            await new Promise((resolve) => { this.waiter = resolve; });
+          }
+        },
+      };
 
-      let blob = null;
-      const dest = await DL.transfer.sinkFor(incoming.dest, item, (b) => { blob = b; });
-      incoming.pipe = stream.pipeTo(dest).then(() => {
-        item.blob = blob;
-        item.elapsed = (Date.now() - item.startedAt) / 1000;
-        item.savedToDisk = incoming.dest.kind !== 'seal';
-        // State is settled in endItem, once the sender's checksum has arrived.
-      });
-    }
+      const inbound = { held: false, sink: null };
 
-    async function endItem(itemId, expectedCrc, expectedBytes, chunkCount) {
-      if (!incoming) return;
+      let stripeWriter = null;
+      let stripeReader = null;
+      let beginAckWaiter = null;
 
-      // Payload rode the stripes, so wait for the reported number of chunks to
-      // be reassembled before closing the stream.
-      if (stripeReader && typeof chunkCount === 'number') {
-        await Promise.race([
-          stripeReader.complete(chunkCount),
-          new Promise((r) => setTimeout(r, 15000)),
-        ]);
+      const outQueue = [];
+      let sending = false;
+
+      let offer = null;    // batch awaiting the user's decision
+      let incoming = null; // batch being received
+      let pendingOut = null;
+      const outbox = [];
+
+      const live = () => !!conn && conn.open && !closed;
+      const tag = (item) => ({ ...item, from: link.id, peerLabel: link.label });
+      const emitItem = (item) => emit('item', tag(item));
+
+      /* ── transport plumbing ── */
+
+      // PeerJS's negotiator installs pc.ondatachannel and treats whatever
+      // arrives as *its* connection's channel, re-initialising the
+      // DataConnection and re-firing 'open'. Our stripe channels would each
+      // trigger that, which both restarts the handshake and hands PeerJS the
+      // wrong channel to send control messages on. Keep ours away from it;
+      // addEventListener listeners still fire, so collection is unaffected.
+      function shieldPeerJs(c) {
+        const pc = c && c.peerConnection;
+        if (!pc || pc.__droplineShielded) return !!pc;
+        pc.__droplineShielded = true;
+
+        // Capture whatever PeerJS has already installed, then take ownership of
+        // the property so later assignments land in `inner` instead of the
+        // platform's handler slot.
+        let inner = pc.ondatachannel;
+        // Clearing through the native setter first is what actually matters:
+        // defineProperty only rebinds the JS-visible property, while the
+        // handler PeerJS already assigned lives in the platform's internal slot
+        // and would keep being dispatched.
+        pc.ondatachannel = null;
+        const wrapper = (ev) => {
+          const label = ev && ev.channel && ev.channel.label;
+          if (label && label.startsWith(DL.stripe.LABEL)) return;   // ours, not PeerJS's
+          if (typeof inner === 'function') inner.call(pc, ev);
+        };
+
+        Object.defineProperty(pc, 'ondatachannel', {
+          configurable: true,
+          get() { return inner; },
+          set(fn) { inner = fn; },
+        });
+        pc.addEventListener('datachannel', wrapper);
+        return true;
       }
-      const item = incoming.items.find((i) => i.id === itemId);
 
-      if (incoming.sink) {
-        try { incoming.sink.close(); } catch { /* already closed */ }
-        incoming.sink = null;
+      // peerConnection may not exist the instant a connection is created, and
+      // the shield has to be in place before any stripe channel arrives.
+      function shieldWhenReady(c) {
+        if (shieldPeerJs(c)) return;
+        let tries = 0;
+        const timer = setInterval(() => {
+          if (shieldPeerJs(c) || ++tries > 40) clearInterval(timer);
+        }, 25);
       }
-      inbound.sink = null;
-      if (inbound.held) { inbound.held = false; send(P.go()); }
 
-      try {
-        await incoming.pipe;
-      } catch {
-        if (item) emit('item', { ...item, state: 'failed', detail: 'Could not write the file.' });
-        return;
+      // One side creates the channels and the other adopts them; both may then
+      // send, since a data channel is duplex. Failure here is not fatal -- the
+      // transfer simply runs on the control channel as before.
+      function setupStripes(c) {
+        const pc = c.peerConnection;
+        if (!pc) return;
+        shieldPeerJs(c);
+        const count = DL.stripe.countFor();
+
+        const attachChannels = (channels) => {
+          if (!channels) return;
+          stripeWriter = DL.stripe.writer(channels, { high: 2 * 1024 * 1024 });
+          stripeReader = DL.stripe.reader(channels, (chunk) => {
+            if (incoming && incoming.sink) incoming.sink.enqueue(chunk);
+          });
+          emit('transport', { stripes: channels.length, from: link.id });
+        };
+
+        if (isHost) {
+          DL.stripe.create(pc, count).then(attachChannels).catch(() => {});
+        } else {
+          DL.stripe.collect(pc, count, attachChannels);
+        }
       }
-      if (!item) return;
 
-      // The transport is reliable and ordered, so a mismatch means a bug on one
-      // side rather than a lossy link — which is exactly why it is worth
-      // checking. Silent corruption is the one failure nobody notices.
-      const got = DL.util.crcFinal(item.crc);
-      const sizeOk = expectedBytes === undefined || item.done === expectedBytes;
-      const crcOk = expectedCrc === undefined || got === expectedCrc;
-
-      if (crcOk && sizeOk) {
-        item.state = 'done';
-        item.verified = expectedCrc !== undefined;
-      } else {
-        item.state = 'failed';
-        item.detail = sizeOk
-          ? 'Checksum mismatch — the file arrived corrupted.'
-          : `Incomplete — expected ${expectedBytes} bytes, got ${item.done}.`;
+      async function describeLink() {
+        try {
+          const pc = conn && conn.peerConnection;
+          if (!pc || !pc.getStats) return null;
+          const stats = await pc.getStats();
+          let pair = null;
+          stats.forEach((r) => {
+            if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r;
+          });
+          if (!pair) return null;
+          let local = null;
+          let remote = null;
+          stats.forEach((r) => {
+            if (r.id === pair.localCandidateId) local = r;
+            if (r.id === pair.remoteCandidateId) remote = r;
+          });
+          const relayed = (local && local.candidateType === 'relay')
+            || (remote && remote.candidateType === 'relay');
+          return {
+            relayed: !!relayed,
+            rtt: typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime : null,
+            localType: local ? local.candidateType : null,
+            remoteType: remote ? remote.candidateType : null,
+          };
+        } catch {
+          return null;
+        }
       }
-      emit('item', { ...item });
-    }
 
-    // Called from a click: the file pickers need a user gesture.
-    async function acceptOffer(opts) {
-      if (!offer) return;
-      const files = offer.items.filter((i) => i.kind === 'file');
-      // Auto-accept has no user gesture, so no picker may be opened; those
-      // transfers land via the sealing path and a download link.
-      const dest = (opts && opts.silent)
-        ? { kind: 'seal' }
-        : await DL.transfer.chooseDestination(files);
-      if (!dest) return; // cancelled — leave the offer standing
-      incoming = { ...offer, dest, sink: null, pipe: null };
-      offer = null;
-      send(P.accept(incoming.batchId));
-      emit('accepted', incoming);
-    }
+      /* ── connection lifecycle ── */
 
-    function declineOffer() {
-      if (!offer) return;
-      send(P.decline(offer.batchId, 'declined'));
-      emit('declined', offer);
-      offer = null;
-    }
+      function attach(c) {
+        conn = c;
+        let chain = Promise.resolve();
+        handshakeDone = false;
+        shieldWhenReady(c);
 
-    /* ── outbound ── */
+        c.on('open', async () => {
+          note('open', { role: isHost ? 'host' : 'guest', link: link.id, repeat: handshakeDone });
+          if (handshakeDone) { flushOutbox(); return; }   // never redo the handshake
+          handshakeDone = true;
+          retry = 0;
+          helloSeen = false;
+          authed = !secret;
+          gate.release();
+          c.send(P.hello(options.name || 'someone', DL.stripe.countFor(), me));
 
-    let pendingOut = null;
+          if (secret) {
+            myNonce = newSecret();
+            c.send(P.auth(myNonce));
+            emit('code', await shortCode(secret));
+          }
 
-    // Control messages can be produced before the channel reports open --
-    // a peer's auth challenge routinely arrives first -- and dropping them
-    // silently strands the handshake. Queue instead, and flush on open.
-    const outbox = [];
+          setupStripes(c);
 
-    function send(raw) {
-      let type = '?';
-      try { type = JSON.parse(raw).t; } catch { /* not control */ }
-      if (live()) { note('tx', { type }); conn.send(raw); return; }
-      if (!closed) { note('queued', { type }); outbox.push(raw); }
-    }
+          flushOutbox();
+          emit('status', 'connected');
+          announceTopology();
+          describeLink().then((q) => { if (q) emit('link-quality', { ...q, from: link.id }); });
+          setTimeout(() => describeLink().then((q) => { if (q) emit('link-quality', { ...q, from: link.id }); }), 2500);
+          resumeOrPump();
+        });
 
-    function flushOutbox() {
-      while (outbox.length && live()) conn.send(outbox.shift());
-    }
+        // Serialised: converting a Blob is async, and overlapping handlers
+        // would enqueue chunks out of order and silently corrupt a file.
+        c.on('data', (data) => {
+          chain = chain.then(() => route(data)).catch((err) => {
+            emit('error', `Transfer failed: ${err && err.message ? err.message : err}`);
+          });
+        });
 
-    function enqueue(entries) {
-      outQueue.push(entries);
-      pump();
-    }
+        c.on('close', () => {
+          note('close', { link: link.id });
+          if (closed) return;
+          pauseActiveTransfers();
+          conn = null;
+          stripeWriter = null;
+          stripeReader = null;
+          gate.release();
+          announceTopology();
+          if (isHost) {
+            if (!peerCount()) emit('status', 'waiting');
+          } else {
+            scheduleRetry();
+          }
+        });
 
-    async function pump() {
-      if (sending || !outQueue.length || !live()) return;
-      sending = true;
-      const entries = outQueue.shift();
+        c.on('error', () => { /* close follows; handled there */ });
+      }
 
-      try {
-        await sendBatch(entries);
-      } catch (err) {
-        emit('error', `Send failed: ${err && err.message ? err.message : err}`);
-        entries.forEach((e) => emit('item', {
-          id: e.tempId, dir: 'out', kind: e.kind, name: e.name, size: e.size,
-          state: 'failed', detail: 'Send failed.',
-        }));
-      } finally {
+      // Hand a freshly-arrived connection to this existing link, so a
+      // reconnecting device keeps its partly-transferred files.
+      function adoptFrom(fresh) {
+        attach(fresh.takeConn());
+      }
+
+      /* ── interruption and resume ──
+         A dropped connection is not a failure yet. Everything needed to carry
+         on is kept: what the receiver has committed, and where the sender had
+         reached. Both sides mark the item paused and settle it on reconnect. */
+
+      function pauseActiveTransfers() {
+        if (incoming) {
+          // Close the pipeline cleanly so the sealing sink keeps what it has
+          // rather than discarding it.
+          try { incoming.sink && incoming.sink.close(); } catch { /* already gone */ }
+          incoming.sink = null;
+          incoming.items.forEach((it) => {
+            if (it.state === 'active') {
+              it.state = 'paused';
+              it.detail = 'Waiting to resume…';
+              emitItem(it);
+            }
+          });
+        }
+        inbound.sink = null;
+        inbound.held = false;
         sending = false;
-        if (outQueue.length) pump();
-      }
-    }
-
-    async function sendBatch(entries) {
-      const batchId = `b${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-      const withGzip = await Promise.all(entries.map(async (e) => ({
-        ...e,
-        gzip: e.kind === 'file' && await DL.transfer.shouldCompress(e.file, e.mime),
-      })));
-      const { items, wire } = P.manifest(batchId, withGzip);
-
-      items.forEach((it) => emit('item', { ...it, dir: 'out', state: 'offered', done: 0 }));
-      send(wire);
-
-      const accepted = await new Promise((resolve) => {
-        pendingOut = { batchId, resolve };
-        setTimeout(() => {
-          if (pendingOut && pendingOut.batchId === batchId) { pendingOut = null; resolve(false); }
-        }, 120000);
-      });
-
-      if (!accepted) {
-        items.forEach((it) => emit('item', { ...it, dir: 'out', state: 'declined' }));
-        return;
       }
 
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        const entry = withGzip[i];
-        if (!live()) throw new Error('connection lost');
+      function resumeOrPump() {
+        // Ask about anything we were part-way through sending before queueing
+        // new work behind it.
+        if (inflight) {
+          note('resume-ask', { item: inflight.item.id });
+          send(P.resume(inflight.item.id));
+        }
+        pump();
+      }
 
+      let inflight = null;      // { item, entry, sentBytes, crcAt } while sending
+      let resumeWaiter = null;
+
+      /* ── inbound ── */
+
+      async function route(raw) {
+        if (typeof raw !== 'string') {
+          if (!incoming || !incoming.sink) return;
+          const view = await DL.transfer.toBytes(raw);
+          if (!view) return;
+          incoming.sink.enqueue(view);
+          if (!inbound.held && incoming.sink.desiredSize !== null && incoming.sink.desiredSize <= 0) {
+            inbound.held = true;
+            send(P.hold());
+          }
+          return;
+        }
+
+        const msg = P.parse(raw);
+        if (!msg) { note('rx-unparsed'); return; }
+        note('rx', { type: msg.t, link: link.id });
+
+        switch (msg.t) {
+          case P.T.HELLO:
+            helloSeen = true;
+            rekey(link, msg.client);
+            emit('peer', { name: msg.name, version: msg.v, from: link.id });
+            break;
+
+          case P.T.AUTH:
+            if (secret && typeof msg.nonce === 'string') {
+              send(P.proof(await digest(`${secret}:${msg.nonce}`)));
+            }
+            break;
+
+          case P.T.PROOF: {
+            // Ignore anything we did not ask for: a late reply from a previous
+            // connection is not an impostor, and tearing the session down for
+            // one would be worse than the problem.
+            if (!secret || !myNonce) break;
+            const want = await digest(`${secret}:${myNonce}`);
+            myNonce = null;
+            if (msg.value === want) {
+              note('auth-ok');
+              authed = true;
+              emit('authenticated', true);
+            } else {
+              note('auth-mismatch', { got: String(msg.value).slice(0, 8), want: want.slice(0, 8) });
+              emit('error', 'The other device could not prove it holds this link.');
+              drop();
+            }
+            break;
+          }
+
+          case P.T.HOLD: gate.hold(); break;
+          case P.T.GO:   gate.release(); break;
+
+          case P.T.MANIFEST:
+            if (!authed) { send(P.decline(msg.batchId, 'unauthenticated')); break; }
+            offer = {
+              batchId: msg.batchId,
+              from: link.id,
+              items: msg.items.map((it) => ({ ...it, dir: 'in', state: 'offered', done: 0 })),
+            };
+            emit('offer', { ...offer, peerLabel: link.label });
+            break;
+
+          case P.T.ACCEPT:
+            if (pendingOut && pendingOut.batchId === msg.batchId) {
+              pendingOut.resolve(true);
+              pendingOut = null;
+            }
+            break;
+
+          case P.T.DECLINE:
+            if (pendingOut && pendingOut.batchId === msg.batchId) {
+              pendingOut.resolve(false);
+              pendingOut = null;
+            }
+            break;
+
+          case P.T.TEXT: {
+            const item = incoming && incoming.items.find((i) => i.id === msg.itemId);
+            const name = item ? item.name : 'Text';
+            emitItem({ id: msg.itemId, dir: 'in', kind: 'text', name, body: msg.body, state: 'done', size: msg.body.length });
+            break;
+          }
+
+          // The far end wants to carry on where it left off. Tell it exactly
+          // how much of that item we already hold.
+          case P.T.RESUME: {
+            const item = incoming && incoming.items.find((i) => i.id === msg.itemId);
+            const at = item && item.state === 'paused' ? item.done : 0;
+            note('resume-at', { item: msg.itemId, at });
+            send(P.resumeAt(msg.itemId, at, item ? DL.util.crcFinal(item.crc) : 0));
+            break;
+          }
+
+          case P.T.RESUME_AT:
+            if (resumeWaiter) { const w = resumeWaiter; resumeWaiter = null; w(msg); }
+            break;
+
+          case P.T.BEGIN:
+            await beginItem(msg.itemId, msg.at || 0);
+            send(P.beginAck(msg.itemId));   // control and payload are separate
+            break;                          // channels; never assume an order
+
+          case P.T.BEGIN_ACK:
+            if (beginAckWaiter) { const w = beginAckWaiter; beginAckWaiter = null; w(); }
+            break;
+
+          case P.T.END:
+            await endItem(msg.itemId, msg.crc, msg.bytes, msg.chunks);
+            break;
+
+          case P.T.DONE:
+            if (incoming) { emit('batchDone', { ...incoming, peerLabel: link.label }); incoming = null; }
+            break;
+
+          case P.T.BYE:
+            emit('status', 'closed');
+            break;
+
+          default: break;
+        }
+      }
+
+      async function beginItem(itemId, at) {
+        if (!incoming) return;
+        const item = incoming.items.find((i) => i.id === itemId);
+        if (!item) return;
+
+        const resuming = at > 0 && item.state === 'paused' && item.done === at;
+
+        incoming.current = item;
+        item.state = 'active';
+        item.detail = null;
+        if (!resuming) {
+          item.done = 0;
+          item.crc = DL.util.crcInit();
+          item.startedAt = Date.now();
+          item.parts = null;
+        } else {
+          note('resuming-recv', { item: itemId, at });
+        }
+
+        let sink = null;
+        const readable = new ReadableStream(
+          { start(c) { sink = c; } },
+          new ByteLengthQueuingStrategy({ highWaterMark: DL.device.profile.watermark }),
+        );
+        incoming.sink = sink;
+        inbound.sink = sink;
+        inbound.held = false;
+        if (stripeReader) stripeReader.reset();
+
+        const tick = DL.util.throttle(() => emitItem(item), DL.device.profile.repaintMs);
+
+        let stream = readable;
+        // A resumed segment is compressed as its own gzip stream, so a fresh
+        // decompressor is correct here rather than a continuation.
+        if (item.gzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
+
+        // Checksum after decompression, so this hashes the same plaintext the
+        // sender hashed before compressing it.
+        stream = stream.pipeThrough(new TransformStream({
+          transform(chunk, ctrl) {
+            item.done += chunk.byteLength;
+            item.crc = DL.util.crcUpdate(item.crc, chunk);
+            tick();
+            if (inbound.held && inbound.sink && inbound.sink.desiredSize > 0) {
+              inbound.held = false;
+              send(P.go());
+            }
+            ctrl.enqueue(chunk);
+          },
+        }));
+
+        const dest = await DL.transfer.sinkFor(incoming.dest, item, resuming);
+        incoming.pipe = stream.pipeTo(dest).then(() => {
+          item.elapsed = (Date.now() - item.startedAt) / 1000;
+          item.savedToDisk = incoming.dest.kind !== 'seal';
+          // State is settled in endItem, once the sender's checksum arrives.
+        });
+      }
+
+      async function endItem(itemId, expectedCrc, expectedBytes, chunkCount) {
+        if (!incoming) return;
+
+        // Payload rode the stripes, so wait for the reported number of chunks
+        // to be reassembled before closing the stream.
+        if (stripeReader && typeof chunkCount === 'number') {
+          await Promise.race([
+            stripeReader.complete(chunkCount),
+            new Promise((r) => setTimeout(r, 15000)),
+          ]);
+        }
+        const item = incoming.items.find((i) => i.id === itemId);
+
+        if (incoming.sink) {
+          try { incoming.sink.close(); } catch { /* already closed */ }
+          incoming.sink = null;
+        }
+        inbound.sink = null;
+        if (inbound.held) { inbound.held = false; send(P.go()); }
+
+        try {
+          await incoming.pipe;
+        } catch {
+          if (item) emitItem({ ...item, state: 'failed', detail: 'Could not write the file.' });
+          return;
+        }
+        if (!item) return;
+
+        // The transport is reliable and ordered, so a mismatch means a bug on
+        // one side rather than a lossy link — which is exactly why it is worth
+        // checking. Silent corruption is the one failure nobody notices.
+        const got = DL.util.crcFinal(item.crc);
+        const sizeOk = expectedBytes === undefined || item.done === expectedBytes;
+        const crcOk = expectedCrc === undefined || got === expectedCrc;
+
+        if (crcOk && sizeOk) {
+          item.state = 'done';
+          item.verified = expectedCrc !== undefined;
+          item.blob = DL.transfer.finishBlob(item);
+        } else {
+          item.state = 'failed';
+          item.detail = sizeOk
+            ? 'Checksum mismatch — the file arrived corrupted.'
+            : `Incomplete — expected ${expectedBytes} bytes, got ${item.done}.`;
+        }
+        emitItem(item);
+      }
+
+      // Called from a click: the file pickers need a user gesture.
+      async function acceptOffer(opts) {
+        if (!offer) return false;
+        const files = offer.items.filter((i) => i.kind === 'file');
+        // Auto-accept has no user gesture, so no picker may be opened; those
+        // transfers land via the sealing path and a download link.
+        const dest = (opts && opts.silent)
+          ? { kind: 'seal' }
+          : await DL.transfer.chooseDestination(files);
+        if (!dest) return false; // cancelled — leave the offer standing
+        incoming = { ...offer, dest, sink: null, pipe: null };
+        offer = null;
+        send(P.accept(incoming.batchId));
+        emit('accepted', incoming);
+        return true;
+      }
+
+      function declineOffer() {
+        if (!offer) return false;
+        send(P.decline(offer.batchId, 'declined'));
+        emit('declined', offer);
+        offer = null;
+        return true;
+      }
+
+      /* ── outbound ── */
+
+      // Control messages can be produced before the channel reports open --
+      // a peer's auth challenge routinely arrives first -- and dropping them
+      // silently strands the handshake. Queue instead, and flush on open.
+      function send(raw) {
+        let type = '?';
+        try { type = JSON.parse(raw).t; } catch { /* not control */ }
+        if (live()) { note('tx', { type, link: link.id }); conn.send(raw); return; }
+        if (!closed) { note('queued', { type, link: link.id }); outbox.push(raw); }
+      }
+
+      function flushOutbox() {
+        while (outbox.length && live()) conn.send(outbox.shift());
+      }
+
+      function enqueue(entries) {
+        outQueue.push(entries);
+        pump();
+      }
+
+      async function pump() {
+        if (sending || !outQueue.length || !live()) return;
+        sending = true;
+        const entries = outQueue.shift();
+
+        try {
+          await sendBatch(entries);
+        } catch (err) {
+          if (!closed && conn) {
+            emit('error', `Send failed: ${err && err.message ? err.message : err}`);
+          }
+        } finally {
+          sending = false;
+          if (outQueue.length) pump();
+        }
+      }
+
+      async function sendBatch(entries) {
+        const batchId = `b${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        const withGzip = await Promise.all(entries.map(async (e) => ({
+          ...e,
+          gzip: e.kind === 'file' && await DL.transfer.shouldCompress(e.file, e.mime),
+        })));
+        const { items, wire } = P.manifest(batchId, withGzip);
+
+        items.forEach((it) => emitItem({ ...it, dir: 'out', state: 'offered', done: 0 }));
+        send(wire);
+
+        const accepted = await new Promise((resolve) => {
+          pendingOut = { batchId, resolve };
+          setTimeout(() => {
+            if (pendingOut && pendingOut.batchId === batchId) { pendingOut = null; resolve(false); }
+          }, 120000);
+        });
+
+        if (!accepted) {
+          items.forEach((it) => emitItem({ ...it, dir: 'out', state: 'declined' }));
+          return;
+        }
+
+        for (let i = 0; i < items.length; i++) {
+          if (!live()) throw new Error('connection lost');
+          await sendItem(items[i], withGzip[i]);
+        }
+
+        send(P.done(batchId));
+        emit('batchSent', items);
+      }
+
+      async function sendItem(item, entry) {
         if (item.kind === 'text') {
           send(P.text(item.id, entry.body));
-          emit('item', { ...item, dir: 'out', state: 'done', done: item.size, body: entry.body });
-          continue;
+          emitItem({ ...item, dir: 'out', state: 'done', done: item.size, body: entry.body });
+          return;
         }
 
+        inflight = { item, entry, started: Date.now() };
+        let at = 0;
+
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await streamItem(item, entry, at);
+            inflight = null;
+            return;
+          } catch (err) {
+            if (closed) { inflight = null; return; }
+            // A dropped connection is recoverable: hold the item and let the
+            // reconnect ask the receiver where to pick up.
+            emitItem({ ...item, dir: 'out', state: 'paused', detail: 'Waiting to resume…' });
+            note('send-interrupted', { item: item.id, err: String(err && err.message || err) });
+
+            const answer = await waitForResume();
+            if (!answer) { inflight = null; throw err; }
+            at = answer.at || 0;
+            note('resuming-send', { item: item.id, at });
+          }
+        }
+      }
+
+      // Resolved by a RESUME_AT arriving after the connection comes back.
+      function waitForResume() {
+        return new Promise((resolve) => {
+          resumeWaiter = resolve;
+          setTimeout(() => {
+            if (resumeWaiter === resolve) { resumeWaiter = null; resolve(null); }
+          }, 90000);
+        });
+      }
+
+      async function streamItem(item, entry, at) {
         const started = Date.now();
-        emit('item', { ...item, dir: 'out', state: 'active', done: 0 });
+        emitItem({ ...item, dir: 'out', state: 'active', done: at });
         const tick = DL.util.throttle(
-          (n) => emit('item', { ...item, dir: 'out', state: 'active', done: n }),
+          (n) => emitItem({ ...item, dir: 'out', state: 'active', done: n }),
           DL.device.profile.repaintMs);
 
         // The receiver must be listening before payload starts, because it
         // travels on different channels from this message.
         const acked = new Promise((resolve) => { beginAckWaiter = resolve; });
-        send(P.begin(item.id));
+        send(P.begin(item.id, at));
         await Promise.race([acked, new Promise((r) => setTimeout(r, 8000))]);
         beginAckWaiter = null;
 
-        const sctp = conn.peerConnection && conn.peerConnection.sctp;
+        const sctp = conn && conn.peerConnection && conn.peerConnection.sctp;
         const chunkSize = Math.min(
           DL.util.chunkSize(sctp && sctp.maxMessageSize),
           DL.device.profile.chunkCap,
         );
 
         if (stripeWriter) stripeWriter.reset();   // per item, to match the reader
-        const write = stripeWriter
-          ? (buf) => stripeWriter.send(buf)
+        const writer = stripeWriter;
+        const write = writer
+          ? (buf) => writer.send(buf)
           : (buf) => { conn.send(buf); };
 
         const { wire: onWire, crc, chunks } = await DL.transfer.pumpFile(entry.file, {
@@ -1693,45 +1921,85 @@ DL.session = (function () {
           onProgress: tick,
           chunkSize,
           write,
+          from: at,
         });
 
-        if (stripeWriter) await stripeWriter.flush();
-        send(P.end(item.id, crc, item.size, stripeWriter ? chunks : undefined));
+        if (writer) await writer.flush();
+        if (!live()) throw new Error('connection lost');
+        send(P.end(item.id, crc, item.size, writer ? chunks : undefined));
 
-        emit('item', {
+        emitItem({
           ...item, dir: 'out', state: 'done', done: item.size,
           elapsed: (Date.now() - started) / 1000, wire: onWire,
         });
       }
 
-      send(P.done(batchId));
-      emit('batchSent', items);
+      function drop() {
+        try { if (conn) conn.close(); } catch { /* already gone */ }
+        conn = null;
+        links.delete(link.id);
+        announceTopology();
+      }
+
+      Object.assign(link, {
+        attach, adoptFrom, enqueue, acceptOffer, declineOffer, describeLink, drop,
+        live,
+        takeConn() { const c = conn; conn = null; return c; },
+        get authed() { return authed; },
+        get helloSeen() { return helloSeen; },
+        get hasOffer() { return !!offer; },
+      });
+      return link;
     }
 
     /* ── public surface ── */
+
+    const activeLinks = () => [...links.values()].filter((l) => l.live());
 
     // Accepts either prepared entries (with a relative path) or bare Files.
     function sendFiles(input) {
       const entries = Array.from(input).map((e) => (e && e.file ? e : {
         kind: 'file', file: e, name: e.name, size: e.size, mime: e.type, path: '',
       }));
-      if (entries.length) enqueue(entries);
-      return entries.length;
+      if (!entries.length) return 0;
+      const targets = activeLinks();
+      targets.forEach((l) => l.enqueue(entries));
+      return targets.length;
     }
 
     function sendText(body) {
       if (!body || !body.trim()) return 0;
       const trimmed = body.slice(0, 100000);
-      enqueue([{ kind: 'text', body: trimmed, name: 'Text snippet', size: trimmed.length, mime: 'text/plain' }]);
-      return 1;
+      const entry = { kind: 'text', body: trimmed, name: 'Text snippet', size: trimmed.length, mime: 'text/plain' };
+      const targets = activeLinks();
+      targets.forEach((l) => l.enqueue([entry]));
+      return targets.length;
+    }
+
+    async function acceptOffer(opts) {
+      // Whichever link is asking. With several, the first pending one wins and
+      // the next prompt follows immediately after.
+      for (const l of links.values()) {
+        if (l.hasOffer) return l.acceptOffer(opts);
+      }
+      return false;
+    }
+
+    function declineOffer() {
+      for (const l of links.values()) {
+        if (l.hasOffer) return l.declineOffer();
+      }
+      return false;
     }
 
     function close() {
       closed = true;
-      try { send(P.bye()); } catch { /* connection already gone */ }
+      for (const l of links.values()) {
+        try { l.drop(); } catch { /* already gone */ }
+      }
+      links.clear();
       try { if (peer) peer.destroy(); } catch { /* already destroyed */ }
       peer = null;
-      conn = null;
     }
 
     start();
@@ -1740,10 +2008,15 @@ DL.session = (function () {
       sendFiles, sendText, acceptOffer, declineOffer, close,
       get hostId() { return hostId; },
       get secret() { return secret; },
-      get authenticated() { return authed; },
+      get peers() { return peerCount(); },
+      get maxPeers() { return MAX_PEERS; },
+      get authenticated() { return activeLinks().some((l) => l.authed); },
+      get connected() { return activeLinks().some((l) => l.helloSeen); },
       get trace() { return trace.slice(); },
-      describeLink,
-      get connected() { return live() && helloSeen; },
+      describeLink() {
+        const first = activeLinks()[0];
+        return first ? first.describeLink() : Promise.resolve(null);
+      },
     };
   }
 
@@ -1757,7 +2030,7 @@ DL.session = (function () {
       : { hostId: raw.slice(0, cut), secret: raw.slice(cut + 1) || null };
   }
 
-  return { create, ID_PREFIX, newSessionId, newSecret, shortCode, parseHash, DEFAULT_ICE };
+  return { create, ID_PREFIX, MAX_PEERS, newSessionId, newSecret, shortCode, parseHash, DEFAULT_ICE };
 })();
 
 
@@ -1849,14 +2122,17 @@ DL.ui = (function () {
 
   function setStatus(state) {
     connState = state;
-    el.statusline.textContent = STATUS_TEXT[state] || state;
+    let text = STATUS_TEXT[state] || state;
+    if (state === 'connected' && peerCount > 1) text = `Connected · ${peerCount} devices`;
+    el.statusline.textContent = text;
     setAppState(state === 'connected' && anyActive() ? 'busy' : state);
     if (state === 'connected') show('session');
     if (state === 'failed') show('error');
-    announce(STATUS_TEXT[state] || state);
+    announce(text);
   }
 
   const anyActive = () => [...items.values()].some((i) => i.state === 'active');
+  let peerCount = 0;
 
   function refreshBusy() {
     if (connState !== 'connected') return;
@@ -1944,10 +2220,11 @@ DL.ui = (function () {
 
   /* ── transfer rows ── */
 
-  function upsert(item) {
-    const previous = items.get(item.id) || {};
+  function upsert(raw) {
+    const item = { ...raw, key: `${raw.from || 'x'}:${raw.id}` };
+    const previous = items.get(item.key) || {};
     const merged = { ...previous, ...item };
-    items.set(item.id, merged);
+    items.set(item.key, merged);
     render(merged);
 
     if (merged.state !== previous.state) {
@@ -1964,10 +2241,10 @@ DL.ui = (function () {
   }
 
   function render(item) {
-    let row = $(`row-${item.id}`);
+    let row = $(`row-${item.key}`);
     if (!row) {
       row = document.createElement('li');
-      row.id = `row-${item.id}`;
+      row.id = `row-${item.key}`;
       row.className = 'row-item';
       row.innerHTML =
         '<div class="item-head">' +
@@ -1988,8 +2265,9 @@ DL.ui = (function () {
     row.dataset.dir = item.dir;
     row.dataset.state = item.state;
     row.querySelector('.item-dir').textContent = item.dir === 'in' ? '↓' : '↑';
-    row.querySelector('.item-name').textContent =
-      (item.path && item.path.length ? item.path.join('/') + '/' : '') + item.name;
+    const prefix = (item.path && item.path.length) ? item.path.join('/') + '/' : '';
+    const who = (peerCount > 1 && item.peerLabel) ? `${item.peerLabel} · ` : '';
+    row.querySelector('.item-name').textContent = who + prefix + item.name;
     row.querySelector('.item-size').textContent =
       item.kind === 'text' ? 'text' : U.bytes(item.size);
 
@@ -2025,6 +2303,7 @@ DL.ui = (function () {
       case 'offered':
         return item.dir === 'in' ? 'Offered' : 'Waiting for them to accept';
       case 'declined': return 'Declined';
+      case 'paused':   return escape(item.detail || 'Paused');
       case 'failed':   return escape(item.detail || 'Failed');
       case 'active': {
         const rate = liveRate(item);
@@ -2119,9 +2398,10 @@ DL.ui = (function () {
     const names = batch.items.slice(0, 2).map((i) => i.name).join(', ');
     const more = batch.items.length > 2 ? ` +${batch.items.length - 2} more` : '';
 
+    const who = (peerCount > 1 && batch.peerLabel) ? `From ${batch.peerLabel}: ` : '';
     el.offerSummary.textContent = files.length
-      ? `${names}${more} — ${U.bytes(total)}`
-      : `${names}${more}`;
+      ? `${who}${names}${more} — ${U.bytes(total)}`
+      : `${who}${names}${more}`;
 
     el.offerAccept.textContent = files.length > 1 && DL.transfer.HAS_DIR
       ? 'Choose folder & accept'
@@ -2337,6 +2617,10 @@ DL.ui = (function () {
         status: setStatus,
         offer: showOffer,
         item: upsert,
+        peers(info) {
+          peerCount = info.count;
+          if (connState === 'connected') setStatus('connected');
+        },
         code: showCode,
         authenticated: markAuthenticated,
         'link-quality': showLinkQuality,

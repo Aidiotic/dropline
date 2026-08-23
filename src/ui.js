@@ -85,14 +85,17 @@ DL.ui = (function () {
 
   function setStatus(state) {
     connState = state;
-    el.statusline.textContent = STATUS_TEXT[state] || state;
+    let text = STATUS_TEXT[state] || state;
+    if (state === 'connected' && peerCount > 1) text = `Connected · ${peerCount} devices`;
+    el.statusline.textContent = text;
     setAppState(state === 'connected' && anyActive() ? 'busy' : state);
     if (state === 'connected') show('session');
     if (state === 'failed') show('error');
-    announce(STATUS_TEXT[state] || state);
+    announce(text);
   }
 
   const anyActive = () => [...items.values()].some((i) => i.state === 'active');
+  let peerCount = 0;
 
   function refreshBusy() {
     if (connState !== 'connected') return;
@@ -180,10 +183,11 @@ DL.ui = (function () {
 
   /* ── transfer rows ── */
 
-  function upsert(item) {
-    const previous = items.get(item.id) || {};
+  function upsert(raw) {
+    const item = { ...raw, key: `${raw.from || 'x'}:${raw.id}` };
+    const previous = items.get(item.key) || {};
     const merged = { ...previous, ...item };
-    items.set(item.id, merged);
+    items.set(item.key, merged);
     render(merged);
 
     if (merged.state !== previous.state) {
@@ -200,10 +204,10 @@ DL.ui = (function () {
   }
 
   function render(item) {
-    let row = $(`row-${item.id}`);
+    let row = $(`row-${item.key}`);
     if (!row) {
       row = document.createElement('li');
-      row.id = `row-${item.id}`;
+      row.id = `row-${item.key}`;
       row.className = 'row-item';
       row.innerHTML =
         '<div class="item-head">' +
@@ -224,8 +228,9 @@ DL.ui = (function () {
     row.dataset.dir = item.dir;
     row.dataset.state = item.state;
     row.querySelector('.item-dir').textContent = item.dir === 'in' ? '↓' : '↑';
-    row.querySelector('.item-name').textContent =
-      (item.path && item.path.length ? item.path.join('/') + '/' : '') + item.name;
+    const prefix = (item.path && item.path.length) ? item.path.join('/') + '/' : '';
+    const who = (peerCount > 1 && item.peerLabel) ? `${item.peerLabel} · ` : '';
+    row.querySelector('.item-name').textContent = who + prefix + item.name;
     row.querySelector('.item-size').textContent =
       item.kind === 'text' ? 'text' : U.bytes(item.size);
 
@@ -261,6 +266,7 @@ DL.ui = (function () {
       case 'offered':
         return item.dir === 'in' ? 'Offered' : 'Waiting for them to accept';
       case 'declined': return 'Declined';
+      case 'paused':   return escape(item.detail || 'Paused');
       case 'failed':   return escape(item.detail || 'Failed');
       case 'active': {
         const rate = liveRate(item);
@@ -355,9 +361,10 @@ DL.ui = (function () {
     const names = batch.items.slice(0, 2).map((i) => i.name).join(', ');
     const more = batch.items.length > 2 ? ` +${batch.items.length - 2} more` : '';
 
+    const who = (peerCount > 1 && batch.peerLabel) ? `From ${batch.peerLabel}: ` : '';
     el.offerSummary.textContent = files.length
-      ? `${names}${more} — ${U.bytes(total)}`
-      : `${names}${more}`;
+      ? `${who}${names}${more} — ${U.bytes(total)}`
+      : `${who}${names}${more}`;
 
     el.offerAccept.textContent = files.length > 1 && DL.transfer.HAS_DIR
       ? 'Choose folder & accept'
@@ -573,6 +580,10 @@ DL.ui = (function () {
         status: setStatus,
         offer: showOffer,
         item: upsert,
+        peers(info) {
+          peerCount = info.count;
+          if (connState === 'connected') setStatus('connected');
+        },
         code: showCode,
         authenticated: markAuthenticated,
         'link-quality': showLinkQuality,

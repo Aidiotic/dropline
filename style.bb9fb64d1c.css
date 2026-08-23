@@ -806,3 +806,8 @@ code {
   from { opacity: 0; transform: translate(-50%, 10px); }
   to   { opacity: 1; transform: translate(-50%, 0); }
 }
+
+/* A paused transfer is waiting to resume, not broken — say so quietly. */
+.row-item[data-state="paused"] .bar-fill { background: var(--muted); }
+.row-item[data-state="paused"] .bar::after { display: none; }
+.row-item[data-state="paused"] .item-state { color: var(--muted); font-style: italic; }
